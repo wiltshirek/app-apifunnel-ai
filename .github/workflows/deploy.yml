@@ -128,7 +128,7 @@ jobs:
           $SCP services/orchestration/openapi "root@$NODE_IP:/opt/api-apifunnel/services/orchestration/"
 
           $SSH "cd /opt/api-apifunnel/services/orchestration && npm ci --production=false && npm run build"
-          $SSH "cd /opt/api-apifunnel && pm2 restart orchestration --update-env 2>/dev/null || pm2 start services/orchestration/dist/index.js --name orchestration --env-file .env --max-memory-restart 512M"
+          $SSH "set -a && source /opt/api-apifunnel/.env && set +a && cd /opt/api-apifunnel && (pm2 restart orchestration --update-env 2>/dev/null || pm2 start services/orchestration/dist/index.js --name orchestration --max-memory-restart 512M)"
           echo "✅ Orchestration deployed"
 
       - name: Deploy lakehouse

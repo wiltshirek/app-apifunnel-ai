@@ -22,9 +22,10 @@ echo "▶ Starting services via PM2..."
 pm2 delete orchestration 2>/dev/null || true
 pm2 delete lakehouse 2>/dev/null || true
 
+set -a && source .env && set +a
+
 pm2 start services/orchestration/dist/index.js \
     --name orchestration \
-    --env-file .env \
     --max-memory-restart 512M
 
 pm2 start "uvicorn src.main:app --host 0.0.0.0 --port 3002 --workers 2" \
