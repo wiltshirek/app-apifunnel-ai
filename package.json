@@ -13,7 +13,6 @@
   "dependencies": {
     "@hono/node-server": "^1.13.7",
     "cron-parser": "^5.0.0",
-    "croner": "^9.0.0",
     "firebase-admin": "^13.2.0",
     "hono": "^4.6.5",
     "jsonwebtoken": "^9.0.2",

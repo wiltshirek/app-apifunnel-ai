@@ -3,7 +3,6 @@ import { serve } from '@hono/node-server';
 import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger } from 'hono/logger';
-import { Cron } from 'croner';
 import { readFileSync } from 'fs';
 import { join } from 'path';
 
@@ -56,25 +55,7 @@ app.onError((err, c) => {
 async function main() {
   await connectDB();
 
-  // In-process cron scheduler — fires once per minute to dispatch due tasks
-  // Replaces Vercel Cron. PM2 keeps this process alive on Hetzner.
-  const CRON_SECRET = process.env.CRON_SECRET;
   const PORT = parseInt(process.env.PORT || '3001', 10);
-  const BASE = `http://localhost:${PORT}`;
-
-  new Cron('* * * * *', async () => {
-    try {
-      const headers: Record<string, string> = { 'Content-Type': 'application/json' };
-      if (CRON_SECRET) headers['Authorization'] = `Bearer ${CRON_SECRET}`;
-      const res = await fetch(`${BASE}/v1/internal/scheduler-tick`, { method: 'POST', headers });
-      const body = await (res.json() as Promise<{ dispatched: number; skipped_dirty: number }>);
-      if (body.dispatched > 0) {
-        console.log(`[Scheduler] dispatched=${body.dispatched} skipped_dirty=${body.skipped_dirty}`);
-      }
-    } catch (err) {
-      console.error('[Scheduler] tick failed:', err);
-    }
-  });
 
   serve({ fetch: app.fetch, port: PORT }, (info) => {
     console.log(`🚀 api-apifunnel-ai listening on http://localhost:${info.port}`);
