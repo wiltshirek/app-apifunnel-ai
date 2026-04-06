@@ -1,8 +1,18 @@
-# api.apifunnel.ai — reverse proxy for all platform services
-#
-# Caddy handles TLS (Let's Encrypt) automatically.
-# Path-based routing sends traffic to the correct backend.
+# Caddy reverse proxy — handles TLS (Let's Encrypt) automatically.
 
+# ── Webhook service (existing Docker container) ──────────────────
+hooks.apifunnel.ai {
+    reverse_proxy 172.17.1.2:3000
+
+    header {
+        Strict-Transport-Security "max-age=31536000; includeSubDomains"
+        X-Content-Type-Options "nosniff"
+        X-Frame-Options "DENY"
+        -Server
+    }
+}
+
+# ── API platform services ────────────────────────────────────────
 api.apifunnel.ai {
     # ── Lakehouse (Python :3002) ──────────────────────────────────
     handle /internal/assets/* {
