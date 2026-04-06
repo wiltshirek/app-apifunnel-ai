@@ -1,0 +1,28 @@
+{
+  "name": "api-apifunnel-ai",
+  "version": "1.0.0",
+  "description": "APIFunnel Orchestration REST API — subagents, scheduled tasks, notifications",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --ext .ts"
+  },
+  "dependencies": {
+    "@hono/node-server": "^1.13.7",
+    "cron-parser": "^5.0.0",
+    "croner": "^9.0.0",
+    "firebase-admin": "^13.2.0",
+    "hono": "^4.6.5",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.9",
+    "@types/node": "^22.13.13",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}

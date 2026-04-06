@@ -1,0 +1,2458 @@
+openapi: 3.1.0
+info:
+  title: Automation & Orchestration API
+  version: 1.0.0
+  description: |
+    REST API for automation orchestration — managing scheduled agent workflows, observing
+    background task execution, reviewing run history, and inter-agent notifications.
+
+    ## Overview
+
+    This API provides orchestrator-level access to the automation layer. It covers:
+    - **Scheduled tasks**: CRUD for recurring cron-driven agent runs
+    - **Run history**: Paginated run logs with performance metrics and learnings
+    - **Subagent observability**: Poll status, retrieve results, and send follow-up messages to dispatched agents
+    - **Notifications**: Source-agnostic signal bus for inter-agent communication
+
+    Subagent **lifecycle** operations (create and cancel) are not part of this API — they are
+    handled exclusively by top-level platform tools (`dispatch_subagent`, `cancel_subagent`)
+    which act as guardrails with platform-level control.
+
+    ## Authentication
+
+    All endpoints require a **Bearer JWT** in the `Authorization` header. The JWT is the same
+    token used by the main web app. It contains `sub` (user ID), `email`, and `name` claims.
+
+    For server-to-server calls (e.g., the subagent runner calling back), the caller uses the
+    user's inherited JWT or a service token with the `X-Admin-Key` header.
+
+    ## Key Concepts
+
+    - **Scheduled Task**: A recurring agent run defined by a prompt + cron expression. Each
+      execution spawns a subagent that runs autonomously and records results.
+
+    - **Subagent**: An autonomous agent that runs a full ReAct loop. Dispatched via platform
+      tools (not this API). This API provides read-only observability and follow-up messaging.
+
+    - **Notification**: A lightweight signal written to Firestore. The primary agent's ReAct
+      loop consumes pending notifications at each iteration boundary as system messages. The
+      browser receives them in real-time via Firestore `onSnapshot`.
+
+    - **Response**: The full output of a completed subagent. Stored in MongoDB on the
+      `SubagentTask` document. Retrieved via `GET /api/subagents/{id}/response`.
+
+  contact:
+    name: API Support
+  license:
+    name: MIT
+
+servers:
+  - url: https://api.apifunnel.ai/v1
+    description: Production
+  - url: http://localhost:3001/v1
+    description: Local development
+
+security:
+  - AdminKeyAuth: []
+    BearerAuth: []
+
+tags:
+  - name: Learning Graph
+    description: |
+      Temporal self-improvement graph for autonomous scheduled runs.
+
+      End-of-run learnings are recorded through the `submit_run_assessment` platform tool.
+
+      Mid-run drill-down into prior knowledge now happens through the
+      `query_learning_graph` platform tool.
+
+      Run history endpoints (`GET /api/scheduled-tasks/{id}/runs` and
+      `GET /api/scheduled-tasks/{id}/runs/summary`) provide the scoreboard needed to
+      make honest comparative efficiency claims. An agent must review run history
+      before setting `run_history_review_status: 0` in `submit_run_assessment`.
+  - name: Subagents
+    description: |
+      Observability and communication endpoints for dispatched subagents. Subagent lifecycle
+      (create, cancel) is managed by top-level platform tools — this API provides read-only
+      status, result retrieval, and follow-up messaging.
+  - name: Scheduled Tasks
+    description: |
+      CRUD operations for prompt-based recurring subagent tasks. Each scheduled task
+      stores a prompt, a cron expression, an optional persona, and a list of required
+      API servers. When the scheduler fires, it spawns an autonomous subagent that
+      executes the prompt and persists the result. Results are stored on the task
+      document — no Firestore notifications are pushed for scheduled runs.
+  - name: Notifications
+    description: |
+      Generic, source-agnostic notification service backed by Firestore. Any event source
+      (subagent completion, Slack message, webhook, scheduled task) can push a notification.
+      The primary agent's ReAct loop consumes pending notifications as system messages.
+      The browser receives them in real-time via Firestore `onSnapshot` listeners.
+
+paths:
+  # ── Learning Graph ──
+
+  /api/scheduled-tasks/{id}/runs:
+    get:
+      operationId: listScheduledTaskRuns
+      summary: List run history for a scheduled task
+      description: |
+        Paginated run history for a scheduled task. Each item is a projection of the
+        `SubagentTask` document from that execution, including performance metrics and
+        any learnings the agent recorded.
+
+        Newest runs first. Use `cursor` + `limit` for pagination.
+
+        **Use this to review run history before making comparative efficiency claims.**
+        If you review this endpoint and then submit the final run report, you may set
+        `run_history_review_status: 0` in `submit_run_assessment` — indicating an honest
+        history review.
+      tags: [Learning Graph]
+      parameters:
+        - $ref: '#/components/parameters/ScheduledTaskId'
+        - name: cursor
+          in: query
+          required: false
+          description: The `run_id` (task_id) of the last item from the previous page.
+          schema:
+            type: string
+        - name: limit
+          in: query
+          required: false
+          description: Max runs per page. Default 20, max 100.
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 100
+        - name: status
+          in: query
+          required: false
+          description: Filter by run status.
+          schema:
+            type: string
+            enum: [done, failed]
+      responses:
+        '200':
+          description: Paginated run history.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunHistoryResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/scheduled-tasks/{id}/runs/summary:
+    get:
+      operationId: getScheduledTaskRunSummary
+      summary: Get aggregated run performance summary for a scheduled task
+      description: |
+        Aggregated performance summary for a scheduled task's run history.
+        Includes median durations, token usage, success/failure counts,
+        current API server set status, and the most recent efficiency hint.
+
+        **Use this as the primary scoreboard before making efficiency claims.**
+        After reviewing this endpoint, you may set `run_history_review_status: 0`
+        in `submit_run_assessment`.
+
+        The `most_recent_efficiency_hint` field shows what the most recent run
+        recommended. Check `run_history_review_status` on that hint — if it was `1`
+        (skipped), treat it as provisional. If it was `0` (reviewed), it is canonical.
+      tags: [Learning Graph]
+      parameters:
+        - $ref: '#/components/parameters/ScheduledTaskId'
+      responses:
+        '200':
+          description: Aggregated run summary.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunSummaryResponse'
+              example:
+                scheduled_task_id: "scht_1711234567_abc123"
+                total_runs: 5
+                successful_runs: 4
+                failed_runs: 1
+                median_duration_ms: 48200
+                median_tokens: 32000
+                median_turns: 9
+                current_api_servers: ["quickbooks_api", "google_sheets"]
+                api_server_set_status: "clean"
+                blocked_reason: null
+                pending_api_recommendations: []
+                most_recent_efficiency_hint:
+                  hint: "No further tweaking required."
+                  status: "no_further_tweaking_required"
+                  run_id: "sa_1711234900_def456"
+                  run_history_review_status: 0
+                most_common_errors:
+                  - error: "Date filter rejected with 400 error"
+                    count: 1
+                runs_without_learnings: 0
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  # ── Subagents ──
+
+  /api/subagents:
+    get:
+      operationId: listSubagents
+      summary: List all subagents for the authenticated user
+      description: |
+        Returns all subagent tasks for the authenticated user, sorted by creation time
+        (most recent first). Includes current status, progress summary, and metadata.
+
+        Use this to display a dashboard of all subagent activity. The `status` field
+        tells you whether each agent is still running, completed, failed, or was cancelled.
+
+        Tasks with `response_consumed: false` and `status: "completed"` have unread results
+        available via `GET /api/subagents/{id}/response`.
+
+        Supports pagination via `cursor` and `limit` query parameters. The `cursor` is
+        the `task_id` of the last item in the previous page.
+      tags: [Subagents]
+      parameters:
+        - name: status
+          in: query
+          required: false
+          description: |
+            Filter by task status. If omitted, returns all statuses.
+            Use `running` to find active agents, `completed` to find agents with results.
+          schema:
+            type: string
+            enum: [queued, running, completed, failed, cancelled]
+        - name: limit
+          in: query
+          required: false
+          description: |
+            Maximum number of tasks to return per page. Default 20, max 100.
+          schema:
+            type: integer
+            default: 20
+            minimum: 1
+            maximum: 100
+        - name: cursor
+          in: query
+          required: false
+          description: |
+            Pagination cursor. Pass the `task_id` of the last item from the previous page
+            to get the next page. Omit for the first page.
+          schema:
+            type: string
+      responses:
+        '200':
+          description: List of subagent tasks.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListSubagentsResponse'
+              example:
+                tasks:
+                  - task_id: "sa_1711234567_abc123"
+                    thread_id: "thread_1711234567_sf1"
+                    label: "Research Salesforce"
+                    status: "running"
+                    progress:
+                      turn: 3
+                      max_turns: 30
+                      message: "Searching Tavily for Salesforce Enterprise pricing..."
+                      updated_at: "2026-03-29T14:31:15.000Z"
+                    response_consumed: false
+                    created_at: "2026-03-29T14:30:00.000Z"
+                    started_at: "2026-03-29T14:30:01.000Z"
+                    completed_at: null
+                  - task_id: "sa_1711234000_def456"
+                    thread_id: "thread_1711234000_hs1"
+                    label: "Research HubSpot"
+                    status: "completed"
+                    progress:
+                      turn: 8
+                      max_turns: 30
+                      message: "Completed."
+                      updated_at: "2026-03-29T14:28:45.000Z"
+                    response_consumed: false
+                    created_at: "2026-03-29T14:25:00.000Z"
+                    started_at: "2026-03-29T14:25:01.000Z"
+                    completed_at: "2026-03-29T14:28:45.000Z"
+                has_more: false
+                next_cursor: null
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/subagents/{id}:
+    get:
+      operationId: getSubagentStatus
+      summary: Get subagent status and metadata
+      description: |
+        Returns the current status, progress, and metadata for a specific subagent task.
+        This does NOT return the full response — use `GET /api/subagents/{id}/response`
+        for that.
+
+        The `progress` object is updated in real-time from Firestore. It shows the current
+        turn number, the max allowed turns, and a human-readable description of what the
+        agent is currently doing.
+
+        If `status` is `"failed"`, the `error` field contains a description of what went wrong.
+        If `status` is `"completed"` and `response_consumed` is `false`, the result is ready
+        to be retrieved.
+      tags: [Subagents]
+      parameters:
+        - $ref: '#/components/parameters/SubagentId'
+      responses:
+        '200':
+          description: Subagent task details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubagentTask'
+              examples:
+                running:
+                  summary: A subagent that is currently running
+                  value:
+                    task_id: "sa_1711234567_abc123"
+                    thread_id: "thread_1711234567_sf1"
+                    label: "Research Salesforce"
+                    status: "running"
+                    progress:
+                      turn: 5
+                      max_turns: 30
+                      message: "Calling Notion API to check existing CRM comparison notes..."
+                      updated_at: "2026-03-29T14:32:00.000Z"
+                    response_consumed: false
+                    error: null
+                    persona_id: "cowork-enterprise"
+                    parent_thread_id: "thread_primary_xyz"
+                    tokens:
+                      input: 12500
+                      output: 3200
+                      total: 15700
+                    created_at: "2026-03-29T14:30:00.000Z"
+                    started_at: "2026-03-29T14:30:01.000Z"
+                    completed_at: null
+                completed:
+                  summary: A subagent that has completed with an unread response
+                  value:
+                    task_id: "sa_1711234567_abc123"
+                    thread_id: "thread_1711234567_sf1"
+                    label: "Research Salesforce"
+                    status: "completed"
+                    progress:
+                      turn: 12
+                      max_turns: 30
+                      message: "Completed."
+                      updated_at: "2026-03-29T14:35:00.000Z"
+                    response_consumed: false
+                    error: null
+                    persona_id: "cowork-enterprise"
+                    parent_thread_id: "thread_primary_xyz"
+                    tokens:
+                      input: 42000
+                      output: 18000
+                      total: 60000
+                    created_at: "2026-03-29T14:30:00.000Z"
+                    started_at: "2026-03-29T14:30:01.000Z"
+                    completed_at: "2026-03-29T14:35:00.000Z"
+                failed:
+                  summary: A subagent that failed due to a missing integration
+                  value:
+                    task_id: "sa_1711234567_abc123"
+                    thread_id: "thread_1711234567_sf1"
+                    label: "Analyze Notion database"
+                    status: "failed"
+                    progress:
+                      turn: 2
+                      max_turns: 30
+                      message: "Failed."
+                      updated_at: "2026-03-29T14:30:30.000Z"
+                    response_consumed: false
+                    error: "Notion OAuth token not found. The user needs to connect Notion via the UI before this subagent can access Notion tools."
+                    persona_id: null
+                    parent_thread_id: null
+                    tokens:
+                      input: 2100
+                      output: 400
+                      total: 2500
+                    created_at: "2026-03-29T14:30:00.000Z"
+                    started_at: "2026-03-29T14:30:01.000Z"
+                    completed_at: "2026-03-29T14:30:30.000Z"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+
+  /api/subagents/{id}/response:
+    get:
+      operationId: getSubagentResponse
+      summary: Get full subagent task outputs (paginated thread)
+      description: |
+        Returns the complete subagent journey — every message, tool call, tool result,
+        and reasoning step from the conversation thread — with stateless pagination.
+
+        The `{id}` path parameter is matched as a `task_id` first, then as a `thread_id`
+        if no task is found. Alternatively, pass `?thread_id=xxx` to look up explicitly
+        by thread ID.
+
+        **Pagination**: The `messages` array is a paginated window over the full thread.
+        Use `offset` and `limit` query parameters to page through. The `pagination` object
+        in the response tells you the total message count and whether more pages exist.
+        Default page size is 50, maximum is 200.
+
+        **The `response` field** is a convenience: the final deliverable text extracted
+        from the `deliver_final_response` tool call in the thread, or `SubagentTask.result`
+        as a fallback for older runs. No content is truncated.
+
+        **Consume-on-read behavior**: The first call sets `response_consumed` to `true`
+        on the `SubagentTask` document (atomic `findOneAndUpdate`). Subsequent calls still
+        return the same data with no additional side effects.
+
+        If the subagent is still `running`, this returns `409 Conflict` with progress.
+        Poll `GET /api/subagents/{id}` for status updates.
+      tags: [Subagents]
+      parameters:
+        - $ref: '#/components/parameters/SubagentId'
+        - name: thread_id
+          in: query
+          required: false
+          description: |
+            Alternative lookup by thread ID. When provided, the `{id}` path parameter
+            is ignored and the task is looked up by its `thread_id` instead. Useful when
+            the caller has a thread reference but not the task ID.
+          schema:
+            type: string
+        - name: offset
+          in: query
+          required: false
+          description: |
+            Number of messages to skip from the start of the thread. Used for stateless
+            pagination. Default 0.
+          schema:
+            type: integer
+            default: 0
+            minimum: 0
+        - name: limit
+          in: query
+          required: false
+          description: |
+            Maximum number of messages to return in this page. Default 50, max 200.
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 200
+        - name: include_lessons_learned
+          in: query
+          required: false
+          description: |
+            Include full lessons learned from this run. When `false` (default), the
+            `lessons_learned` block is still present in every response but long text
+            fields are truncated to 100 characters. When `true`, all fields are
+            returned verbatim with no truncation. Lessons include the structured
+            assessment, error resolutions, API server observations, efficiency
+            findings, and recommended server changes recorded during the run.
+          schema:
+            type: boolean
+            default: false
+      responses:
+        '200':
+          description: |
+            Full subagent task outputs. The `messages` array contains the paginated window
+            of the conversation thread. The `response` field is the final deliverable.
+            The `pagination` object provides total count and paging metadata.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SubagentResponsePayload'
+              examples:
+                first_page:
+                  summary: First page of a completed subagent's thread
+                  value:
+                    task_id: "sa_1711234567_abc123"
+                    thread_id: "thread_1711234567_sf1"
+                    label: "Research Salesforce"
+                    status: "completed"
+                    response: "I researched Salesforce Enterprise pricing for a 50-person team..."
+                    response_consumed: true
+                    assessment:
+                      status: "success"
+                      summary: "Retrieved and compared Salesforce pricing tiers for a 50-person team."
+                    tokens:
+                      input: 42000
+                      output: 18000
+                      total: 60000
+                    turns_used: 12
+                    max_turns: 30
+                    created_at: "2026-03-29T14:30:00.000Z"
+                    completed_at: "2026-03-29T14:35:00.000Z"
+                    delivered_at: "2026-03-29T14:36:00.000Z"
+                    messages:
+                      - role: "user"
+                        content: "Research Salesforce Enterprise pricing for a 50-person team."
+                      - role: "assistant"
+                        content: "I'll search for the latest Salesforce pricing information."
+                        tool_calls:
+                          - id: "tc_001"
+                            type: "function"
+                            function:
+                              name: "tavily_search"
+                              arguments: "{\"query\": \"Salesforce Enterprise pricing 2026 per user\"}"
+                      - role: "tool"
+                        tool_call_id: "tc_001"
+                        content: "[Search results with pricing data...]"
+                    pagination:
+                      offset: 0
+                      limit: 50
+                      total: 127
+                      has_more: true
+                second_page:
+                  summary: Second page via ?offset=50&limit=50
+                  value:
+                    task_id: "sa_1711234567_abc123"
+                    thread_id: "thread_1711234567_sf1"
+                    label: "Research Salesforce"
+                    status: "completed"
+                    response: "I researched Salesforce Enterprise pricing for a 50-person team..."
+                    response_consumed: true
+                    assessment: null
+                    tokens:
+                      input: 42000
+                      output: 18000
+                      total: 60000
+                    turns_used: 12
+                    max_turns: 30
+                    created_at: "2026-03-29T14:30:00.000Z"
+                    completed_at: "2026-03-29T14:35:00.000Z"
+                    delivered_at: "2026-03-29T14:36:00.000Z"
+                    messages:
+                      - role: "assistant"
+                        content: "Now I'll compare these prices with competitor offerings."
+                        tool_calls:
+                          - id: "tc_015"
+                            type: "function"
+                            function:
+                              name: "tavily_search"
+                              arguments: "{\"query\": \"HubSpot CRM pricing vs Salesforce 2026\"}"
+                      - role: "tool"
+                        tool_call_id: "tc_015"
+                        content: "[Comparison search results...]"
+                    pagination:
+                      offset: 50
+                      limit: 50
+                      total: 127
+                      has_more: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            Subagent has not completed yet. The response is not available. Poll
+            `GET /api/subagents/{id}` for status and progress.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "not_completed"
+                message: "Subagent is still running. Poll GET /api/subagents/sa_1711234567_abc123 for progress."
+                task_id: "sa_1711234567_abc123"
+                status: "running"
+                progress:
+                  turn: 5
+                  max_turns: 30
+
+  /api/subagents/{id}/message:
+    post:
+      operationId: sendSubagentMessage
+      summary: Send a follow-up message to a subagent's thread
+      description: |
+        Appends a new user message to an existing subagent's conversation thread and
+        launches a new ReAct loop iteration. This reuses the same `thread_id`, so the
+        subagent has full context of the prior conversation.
+
+        This is fire-and-forget, same as `POST /api/subagents`. The subagent runs
+        asynchronously. A new notification will be pushed to Firestore when this
+        follow-up iteration completes.
+
+        **Use case**: The primary agent retrieves a subagent's response, decides it needs
+        more detail, and sends a follow-up: "Now compare those tiers to HubSpot's pricing."
+
+        The subagent's status is reset to `running` (or `queued`) and `response_consumed`
+        is reset to `false` since a new response will be generated.
+
+        The `max_turns` for this follow-up iteration defaults to the value set when the
+        subagent was created. Override with the `max_turns` field in the request body.
+
+        **Requires**: The subagent must be in `completed` or `failed` status. You cannot
+        send a follow-up to a `running` or `queued` subagent (use `DELETE` to cancel
+        first, then re-create).
+      tags: [Subagents]
+      parameters:
+        - $ref: '#/components/parameters/SubagentId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/SendMessageRequest'
+            example:
+              content: "Now compare those Salesforce tiers to HubSpot's pricing for the same team size."
+              max_turns: 20
+      responses:
+        '200':
+          description: |
+            Follow-up message queued. The subagent will resume with the new message
+            appended to its existing thread. A new notification will be pushed on
+            completion.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/SendMessageResponse'
+              example:
+                task_id: "sa_1711234567_abc123"
+                thread_id: "thread_1711234567_sf1"
+                status: "queued"
+                message: "Follow-up message queued. The subagent will process it with full conversation context."
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '409':
+          description: |
+            Subagent is still running. Cannot send a follow-up to a running subagent.
+            Cancel it first with `DELETE /api/subagents/{id}`, then retry.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+              example:
+                error: "still_running"
+                message: "Subagent is still running. Cancel it first with DELETE /api/subagents/sa_1711234567_abc123, then retry."
+                task_id: "sa_1711234567_abc123"
+                status: "running"
+
+  # ── Scheduled Tasks ──
+
+  /api/scheduled-tasks:
+    post:
+      operationId: createScheduledTask
+      summary: Create a new scheduled task
+      description: |
+        Creates a recurring scheduled task that will execute a prompt on a cron schedule.
+        Each execution spawns an autonomous subagent that runs the prompt with full tool
+        access and persists the result on the task document.
+
+        The cron expression follows standard 5-field syntax (minute hour day-of-month month
+        day-of-week). Examples:
+        - `0 9 * * 1` — every Monday at 9:00 AM
+        - `0 */6 * * *` — every 6 hours
+        - `30 17 1 * *` — 1st of every month at 5:30 PM
+        - `0 8 * * 1-5` — weekdays at 8:00 AM
+
+        Provide `required_api_servers` to declare which API integrations the task needs
+        (e.g., `["quickbooks", "google-sheets"]`). If any are not connected at execution
+        time, the task fails with a clear error rather than producing a partial result.
+      tags: [Scheduled Tasks]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateScheduledTaskRequest'
+            examples:
+              weekly_report:
+                summary: Weekly financial summary
+                value:
+                  prompt: "Pull last week's QuickBooks transactions, summarize by category, and write the report to a Google Sheet named 'Weekly Finance Summary'."
+                  persona_id: "ledgerbot"
+                  label: "Weekly Finance Summary"
+                  schedule: "0 9 * * 1"
+                  timezone: "America/New_York"
+                  required_api_servers: ["quickbooks", "google-sheets"]
+                  max_turns: 30
+              daily_check:
+                summary: Daily inventory check
+                value:
+                  prompt: "Check current inventory levels and flag any items below reorder threshold."
+                  label: "Daily Inventory Check"
+                  schedule: "0 8 * * 1-5"
+                  timezone: "UTC"
+      responses:
+        '201':
+          description: Scheduled task created.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduledTaskResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+    get:
+      operationId: listScheduledTasks
+      summary: List all scheduled tasks
+      description: |
+        Returns all scheduled tasks for the authenticated user, sorted by creation time
+        (most recent first). Soft-deleted tasks are excluded.
+
+        Use the `enabled` query parameter to filter by active/paused status.
+      tags: [Scheduled Tasks]
+      parameters:
+        - name: enabled
+          in: query
+          required: false
+          description: Filter by enabled status. Omit to return all.
+          schema:
+            type: boolean
+      responses:
+        '200':
+          description: List of scheduled tasks.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListScheduledTasksResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/scheduled-tasks/{id}:
+    get:
+      operationId: getScheduledTask
+      summary: Get a single scheduled task
+      description: |
+        Returns the full scheduled task document, including the latest execution result
+        if the task has run at least once.
+      tags: [Scheduled Tasks]
+      parameters:
+        - $ref: '#/components/parameters/ScheduledTaskId'
+      responses:
+        '200':
+          description: Scheduled task details.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduledTaskResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Scheduled task not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    put:
+      operationId: updateScheduledTask
+      summary: Update a scheduled task
+      description: |
+        Updates one or more fields on a scheduled task. Only provided fields are changed;
+        omitted fields are left as-is.
+
+        If `schedule` or `timezone` is changed, `next_run_at` is automatically recalculated.
+        Immutable fields (`scheduled_task_id`, `user_id`, `instance_id`, `run_count`,
+        `last_run`, `last_executed_at`) are silently ignored if included.
+      tags: [Scheduled Tasks]
+      parameters:
+        - $ref: '#/components/parameters/ScheduledTaskId'
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UpdateScheduledTaskRequest'
+            examples:
+              pause:
+                summary: Pause a scheduled task
+                value:
+                  enabled: false
+              change_schedule:
+                summary: Change to daily at 7 AM
+                value:
+                  schedule: "0 7 * * *"
+                  timezone: "America/Chicago"
+              update_prompt:
+                summary: Update the task prompt
+                value:
+                  prompt: "Pull last week's QuickBooks transactions, summarize by category, and email to finance@example.com."
+      responses:
+        '200':
+          description: Updated scheduled task.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ScheduledTaskResponse'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Scheduled task not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+    delete:
+      operationId: deleteScheduledTask
+      summary: Delete a scheduled task
+      description: |
+        Soft-deletes a scheduled task. The task is marked as deleted and disabled.
+        It will no longer appear in list responses or execute on its schedule.
+        This operation is irreversible via the API.
+      tags: [Scheduled Tasks]
+      parameters:
+        - $ref: '#/components/parameters/ScheduledTaskId'
+      responses:
+        '200':
+          description: Scheduled task deleted.
+          content:
+            application/json:
+              schema:
+                type: object
+                required: [scheduled_task_id, deleted]
+                properties:
+                  scheduled_task_id:
+                    type: string
+                    example: "scht_1711234567_abc123"
+                  deleted:
+                    type: boolean
+                    example: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Scheduled task not found.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/notifications:
+    post:
+      operationId: pushNotification
+      summary: Push a notification to a user's notification queue
+      description: |
+        Writes a notification to the user's Firestore pending queue. The notification
+        will be picked up by the primary agent's ReAct loop at the next iteration
+        boundary (as a system message) and/or pushed to the browser in real-time via
+        Firestore `onSnapshot`.
+
+        This endpoint is the HTTP interface for pushing notifications. It is used by:
+        - External webhook ingestion handlers (after verifying signatures)
+        - Scheduled task runners
+        - Any server-side process that cannot write to Firestore directly
+
+        The subagent runner writes to Firestore directly (server-side Firebase Admin SDK),
+        so it does NOT use this endpoint. This endpoint exists for sources that only
+        speak HTTP.
+
+        **Security**: All endpoints require Bearer JWT. The JWT identifies the caller
+        and the target user. No anonymous writes. Per-type origin validation (e.g.,
+        verifying subagent task ownership) can be added later if needed.
+      tags: [Notifications]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PushNotificationRequest'
+            examples:
+              subagent_completed:
+                summary: Subagent completion notification
+                value:
+                  type: "subagent.completed"
+                  source: "subagent:sa_1711234567_abc123"
+                  priority: "normal"
+                  summary: "Subagent 'Research Salesforce' completed successfully."
+                  payload_ref: "sa_1711234567_abc123"
+                  payload_url: "/api/subagents/sa_1711234567_abc123/response"
+              subagent_failed:
+                summary: Subagent failure notification
+                value:
+                  type: "subagent.failed"
+                  source: "subagent:sa_1711234567_def456"
+                  priority: "high"
+                  summary: "Subagent 'Analyze Notion DB' failed: Notion not connected."
+                  payload_ref: "sa_1711234567_def456"
+                  payload_url: "/api/subagents/sa_1711234567_def456"
+              webhook:
+                summary: External webhook notification (future)
+                value:
+                  type: "webhook.received"
+                  source: "webhook:github"
+                  priority: "normal"
+                  summary: "GitHub: PR #42 merged into main by @jane."
+                  payload_ref: "gh_webhook_abc"
+                  payload_url: null
+              slack:
+                summary: Slack message notification (future)
+                value:
+                  type: "slack.message"
+                  source: "slack:C04ABCDEF"
+                  priority: "normal"
+                  summary: "New message in #general from @jane: 'Can you review the Q3 budget?'"
+                  payload_ref: null
+                  payload_url: null
+      responses:
+        '201':
+          description: Notification created and written to Firestore.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PushNotificationResponse'
+              example:
+                notification_id: "notif_1711234800_a1b2c3d4"
+                created_at: "2026-03-29T14:40:00.000Z"
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    get:
+      operationId: listPendingNotifications
+      summary: List pending notifications for the authenticated user
+      description: |
+        Returns all pending (undelivered) notifications for the authenticated user,
+        sorted by creation time (oldest first). These are notifications that have not
+        yet been consumed by the ReAct loop.
+
+        This endpoint reads from Firestore (`/notifications/{userId}/pending/*`).
+
+        **Note**: The browser UI typically uses Firestore `onSnapshot` directly for
+        real-time updates. This HTTP endpoint exists for server-side consumers or
+        debugging purposes.
+      tags: [Notifications]
+      parameters:
+        - name: type
+          in: query
+          required: false
+          description: |
+            Filter by notification type. If omitted, returns all types.
+            Supports prefix matching: `subagent` matches `subagent.completed`,
+            `subagent.failed`, etc.
+          schema:
+            type: string
+          examples:
+            subagent:
+              value: "subagent"
+              summary: All subagent-related notifications
+            specific:
+              value: "subagent.completed"
+              summary: Only completed subagent notifications
+        - name: limit
+          in: query
+          required: false
+          description: Maximum number of notifications to return. Default 50, max 200.
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 200
+      responses:
+        '200':
+          description: List of pending notifications.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListNotificationsResponse'
+              example:
+                notifications:
+                  - notification_id: "notif_1711234800_a1b2c3d4"
+                    type: "subagent.completed"
+                    source: "subagent:sa_1711234567_abc123"
+                    priority: "normal"
+                    summary: "Subagent 'Research Salesforce' completed successfully."
+                    payload_ref: "sa_1711234567_abc123"
+                    payload_url: "/api/subagents/sa_1711234567_abc123/response"
+                    created_at: "2026-03-29T14:40:00.000Z"
+                  - notification_id: "notif_1711234900_e5f6g7h8"
+                    type: "subagent.failed"
+                    source: "subagent:sa_1711234567_def456"
+                    priority: "high"
+                    summary: "Subagent 'Analyze Notion DB' failed: Notion not connected."
+                    payload_ref: "sa_1711234567_def456"
+                    payload_url: "/api/subagents/sa_1711234567_def456"
+                    created_at: "2026-03-29T14:41:00.000Z"
+                count: 2
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/notifications/{id}/ack:
+    post:
+      operationId: acknowledgeNotification
+      summary: Manually acknowledge (consume) a notification
+      description: |
+        Marks a specific notification as delivered and **deletes it from Firestore**.
+        This is the manual equivalent of what happens automatically when the ReAct loop
+        consumes notifications via `consumePendingNotifications()`.
+
+        **Use case**: The browser UI shows a notification in the Notification Panel.
+        The user clicks "Dismiss" or "Inject into chat." The UI calls this endpoint to
+        remove the notification from the pending queue so it doesn't get re-injected
+        into the next ReAct loop iteration.
+
+        If the notification has already been consumed or does not exist, this is a
+        no-op — returns 200 with `already_consumed: true`.
+      tags: [Notifications]
+      parameters:
+        - name: id
+          in: path
+          required: true
+          description: |
+            The notification ID (e.g., `notif_1711234800_a1b2c3d4`). This is the `notification_id`
+            returned by `POST /api/notifications` or `GET /api/notifications`.
+          schema:
+            type: string
+          example: "notif_1711234800_a1b2c3d4"
+      responses:
+        '200':
+          description: Notification acknowledged (deleted from Firestore).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/AcknowledgeNotificationResponse'
+              examples:
+                consumed:
+                  summary: Notification successfully consumed
+                  value:
+                    notification_id: "notif_1711234800_a1b2c3d4"
+                    acknowledged: true
+                    already_consumed: false
+                already_consumed:
+                  summary: Notification was already consumed (no-op)
+                  value:
+                    notification_id: "notif_1711234800_a1b2c3d4"
+                    acknowledged: true
+                    already_consumed: true
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+components:
+  securitySchemes:
+    AdminKeyAuth:
+      type: apiKey
+      in: header
+      name: X-Admin-Key
+      description: |
+        Service-to-service authentication key. Required when calling from the MCP bridge
+        or other internal services. The key is validated against the MCP_ADMIN_KEY
+        environment variable.
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        JWT token from the main web app's authentication system. Contains `sub` (user ID),
+        `email`, and `name` claims. Used alongside AdminKeyAuth for user identity.
+
+        For programmatic / non-browser access, use a Personal Access Token (PAT) in the
+        same Bearer format.
+
+  parameters:
+    SubagentId:
+      name: id
+      in: path
+      required: true
+      description: |
+        The subagent task ID (e.g., `sa_1711234567_abc123`). This is the `task_id` returned
+        by `POST /api/subagents` when the subagent was created.
+      schema:
+        type: string
+      example: "sa_1711234567_abc123"
+
+    ScheduledTaskId:
+      name: id
+      in: path
+      required: true
+      description: |
+        The scheduled task ID (e.g., `scht_1711234567_abc123`). Returned by
+        `POST /api/scheduled-tasks` when the task was created.
+      schema:
+        type: string
+      example: "scht_1711234567_abc123"
+
+  schemas:
+    # ── Learning Graph Schemas ──
+
+    RecordLearningsRequest:
+      type: object
+      required:
+        - api_servers_used
+        - errors_encountered
+        - api_server_observations
+        - efficiency_status
+        - efficiency_next_run
+        - run_history_review_status
+        - recommended_api_servers
+      properties:
+        scheduled_task_id:
+          type: string
+          nullable: true
+          description: The scheduled task this run belongs to. Include when available.
+          example: "scht_1711234567_abc123"
+        subagent_task_id:
+          type: string
+          nullable: true
+          description: The subagent task_id for this run. Include when available.
+          example: "sa_1711234567_abc123"
+        api_servers_used:
+          type: array
+          items:
+            type: string
+          description: Exact canonical API server names used in this run. Must match `list_api_servers` output.
+          example: ["quickbooks_api", "google_sheets"]
+        errors_encountered:
+          type: array
+          description: Specific errors encountered during the run. May be empty.
+          items:
+            type: object
+            required: [error_description, resolution]
+            properties:
+              api_server:
+                type: string
+                nullable: true
+                description: Canonical API server name if this error involved one.
+              error_description:
+                type: string
+                description: What went wrong.
+              root_cause:
+                type: string
+                nullable: true
+                description: Why it happened.
+              resolution:
+                type: string
+                description: How it was resolved, or 'Unresolved'.
+        api_server_observations:
+          type: array
+          description: Non-obvious, reusable observations tied to a specific API server. May be empty.
+          items:
+            type: object
+            required: [api_server, observation]
+            properties:
+              api_server:
+                type: string
+                description: Canonical API server name.
+              observation:
+                type: string
+                description: A concrete, reusable observation about the API server's behavior.
+        efficiency_status:
+          type: string
+          enum: [improvement_found, no_further_tweaking_required]
+          description: Whether this run discovered a useful efficiency improvement for the next run.
+        efficiency_next_run:
+          type: string
+          description: |
+            What should make the next run more efficient. If nothing left to improve,
+            use exactly: 'No further tweaking required.'
+          example: "Use pagination from first request and batch all Sheets writes into one batchUpdate call."
+        run_history_review_status:
+          type: integer
+          enum: [0, 1]
+          description: |
+            `0` = I reviewed run history this run and my efficiency assessment is comparative.
+            `1` = I did not review run history — my efficiency note is local only and will not become canonical guidance.
+        recommended_api_servers:
+          type: array
+          description: |
+            New API servers that would improve future runs. May be empty.
+            **Warning**: Any server not already in the task's approved set triggers the dirty gate
+            and blocks future automatic runs until a human approves the addition.
+          items:
+            type: object
+            required: [api_server, reason]
+            properties:
+              api_server:
+                type: string
+                description: Canonical API server name from list_api_servers.
+              reason:
+                type: string
+                description: Why this API server would help the next run.
+
+    RecordLearningsResponse:
+      type: object
+      required: [recorded, dirty_triggered]
+      properties:
+        recorded:
+          type: boolean
+          description: Whether the learnings were successfully recorded.
+        dirty_triggered:
+          type: boolean
+          description: |
+            True if `recommended_api_servers` contained a server not already in the
+            task's approved set. The scheduled task is now dirty and blocked until
+            a human approves the new server(s).
+        dirty_message:
+          type: string
+          nullable: true
+          description: Human-readable explanation when dirty_triggered is true.
+
+    LearningQueryRequest:
+      type: object
+      required: [query_type]
+      properties:
+        query_type:
+          type: string
+          enum:
+            - task_pattern_context
+            - api_server_history
+            - failure_mode_history
+            - efficiency_history
+            - output_contract_history
+          description: |
+            The type of knowledge to retrieve:
+            - `task_pattern_context`: Prior procedure, constraints, and output contract for this task class
+            - `api_server_history`: All observations and constraints for a specific API server (requires `server_name`)
+            - `failure_mode_history`: Known failure patterns for this task/API surface
+            - `efficiency_history`: Past efficiency hints and their validation status
+            - `output_contract_history`: Expected output format from prior runs
+        prompt_text:
+          type: string
+          nullable: true
+          description: The current task prompt for semantic anchoring. Include for better relevance.
+          example: "Pull last week's QuickBooks transactions and write a summary to Google Sheets"
+        server_name:
+          type: string
+          nullable: true
+          description: Required when `query_type` is `api_server_history`. Canonical API server name.
+          example: "quickbooks_api"
+        limit:
+          type: integer
+          nullable: true
+          default: 10
+          minimum: 1
+          maximum: 20
+          description: Maximum number of facts to return.
+
+    LearningQueryResponse:
+      type: object
+      required: [query_type, facts]
+      properties:
+        query_type:
+          type: string
+          description: The query type that was executed.
+        facts:
+          type: array
+          items:
+            type: string
+          description: Relevant facts from the learning graph, most relevant first.
+          example:
+            - "quickbooks_api date filters must use YYYY-MM-DD format"
+            - "quickbooks_api paginates after 100 transactions"
+
+    TaskRunItem:
+      type: object
+      description: A single run in the scheduled task's run history.
+      properties:
+        run_id:
+          type: string
+          description: The subagent task_id for this run.
+          example: "sa_1711234567_abc123"
+        scheduled_task_id:
+          type: string
+        status:
+          type: string
+          enum: [done, failed]
+        started_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+        duration_ms:
+          type: integer
+          nullable: true
+        tokens:
+          $ref: '#/components/schemas/TokenUsage'
+          nullable: true
+        turns_used:
+          type: integer
+          nullable: true
+        max_turns:
+          type: integer
+        api_servers_used:
+          type: array
+          items:
+            type: string
+        efficiency_status:
+          type: string
+          nullable: true
+          enum: [improvement_found, no_further_tweaking_required]
+        efficiency_next_run:
+          type: string
+          nullable: true
+        run_history_review_status:
+          type: integer
+          nullable: true
+          enum: [0, 1]
+        recommended_api_servers:
+          type: array
+          items:
+            type: object
+            properties:
+              api_server:
+                type: string
+              reason:
+                type: string
+        error_count:
+          type: integer
+        error:
+          type: string
+          nullable: true
+        learnings_recorded_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    RunHistoryResponse:
+      type: object
+      required: [runs, has_more]
+      properties:
+        runs:
+          type: array
+          items:
+            $ref: '#/components/schemas/TaskRunItem'
+        has_more:
+          type: boolean
+        next_cursor:
+          type: string
+          nullable: true
+
+    RunSummaryResponse:
+      type: object
+      required: [scheduled_task_id, total_runs, successful_runs, failed_runs]
+      properties:
+        scheduled_task_id:
+          type: string
+        total_runs:
+          type: integer
+        successful_runs:
+          type: integer
+        failed_runs:
+          type: integer
+        median_duration_ms:
+          type: integer
+          nullable: true
+        median_tokens:
+          type: integer
+          nullable: true
+        median_turns:
+          type: integer
+          nullable: true
+        current_api_servers:
+          type: array
+          items:
+            type: string
+          description: Currently approved API server set for this task.
+        api_server_set_status:
+          type: string
+          enum: [clean, dirty]
+          description: Whether the task is blocked pending API approval.
+        blocked_reason:
+          type: string
+          nullable: true
+          enum: [pending_api_approval]
+        pending_api_recommendations:
+          type: array
+          description: API servers awaiting human approval.
+          items:
+            type: object
+            properties:
+              api_server:
+                type: string
+              reason:
+                type: string
+              recommended_at:
+                type: string
+                format: date-time
+              source_run_id:
+                type: string
+                nullable: true
+        most_recent_efficiency_hint:
+          type: object
+          nullable: true
+          properties:
+            hint:
+              type: string
+            status:
+              type: string
+            run_id:
+              type: string
+            run_history_review_status:
+              type: integer
+              enum: [0, 1]
+        most_common_errors:
+          type: array
+          items:
+            type: object
+            properties:
+              error:
+                type: string
+              count:
+                type: integer
+        runs_without_learnings:
+          type: integer
+          description: Count of completed runs that did not call record.
+
+    # ── Subagent Request Schemas ──
+
+    CreateSubagentSingleRequest:
+      type: object
+      required: [prompt]
+      properties:
+        prompt:
+          type: string
+          description: |
+            The task description for the subagent. Be specific — this becomes the first
+            user message in the subagent's conversation thread. The subagent will execute
+            a full ReAct loop to fulfill this prompt using all available tools.
+          example: "Research Salesforce Enterprise pricing for a 50-person team. Compare Starter, Professional, and Enterprise tiers."
+        personaId:
+          type: string
+          nullable: true
+          description: |
+            The persona ID to use for the subagent's system prompt. If omitted, the
+            subagent inherits the primary agent's default persona. Must be a valid
+            persona ID from the persona registry (e.g., "cowork-enterprise",
+            "cowork-research", "cowork-code").
+          example: "cowork-enterprise"
+        label:
+          type: string
+          nullable: true
+          description: |
+            A short human-readable label for this subagent task. Displayed in the
+            Subagent Panel and notification messages. If omitted, auto-generated from
+            the first ~50 characters of the prompt.
+          example: "Research Salesforce"
+        max_turns:
+          type: integer
+          nullable: true
+          default: 30
+          minimum: 1
+          maximum: 50
+          description: |
+            Maximum number of ReAct loop turns the subagent is allowed to execute before
+            it must end gracefully. Each "turn" is one iteration of the think → act →
+            observe cycle. Default 30. Hard cap 50. When the limit is reached, the
+            subagent summarizes its findings so far and completes — it does not just stop
+            abruptly.
+
+    CreateSubagentBatchRequest:
+      type: object
+      required: [agents]
+      properties:
+        agents:
+          type: array
+          minItems: 1
+          maxItems: 10
+          description: |
+            Array of subagent definitions to launch in parallel. Each agent gets its own
+            `task_id`, `thread_id`, and independent ReAct loop. Maximum 10 agents per
+            batch request.
+          items:
+            type: object
+            required: [id, prompt]
+            properties:
+              id:
+                type: string
+                description: |
+                  A caller-assigned identifier for correlating batch results. This is NOT
+                  the `task_id` — it is returned alongside the `task_id` so the caller can
+                  map results back to their original request. Must be unique within the
+                  batch.
+                example: "sf"
+              prompt:
+                type: string
+                description: The task description for this subagent.
+                example: "Research Salesforce Enterprise pricing for a 50-person team"
+              label:
+                type: string
+                nullable: true
+                description: Human-readable label. Auto-generated if omitted.
+                example: "Salesforce Research"
+              personaId:
+                type: string
+                nullable: true
+                description: Persona ID for this specific subagent.
+              max_turns:
+                type: integer
+                nullable: true
+                default: 30
+                minimum: 1
+                maximum: 50
+                description: Max turns for this specific subagent.
+
+    SendMessageRequest:
+      type: object
+      required: [content]
+      properties:
+        content:
+          type: string
+          description: |
+            The follow-up message to send to the subagent. This is appended as a new
+            user message to the existing conversation thread. The subagent will have
+            full context of all prior messages in the thread when processing this.
+          example: "Now compare those Salesforce tiers to HubSpot's pricing for the same team size."
+        max_turns:
+          type: integer
+          nullable: true
+          minimum: 1
+          maximum: 50
+          description: |
+            Override the max turns for this follow-up iteration. If omitted, uses the
+            value from the original subagent creation.
+
+    # ── Subagent Response Schemas ──
+
+    CreateSubagentSingleResponse:
+      type: object
+      required: [task_id, thread_id, status, created_at]
+      properties:
+        task_id:
+          type: string
+          description: |
+            Unique identifier for this subagent task. Use this ID to poll status
+            (`GET /api/subagents/{task_id}`), retrieve the response
+            (`GET /api/subagents/{task_id}/response`), send follow-ups
+            (`POST /api/subagents/{task_id}/message`), or cancel
+            (`DELETE /api/subagents/{task_id}`).
+          example: "sa_1711234567_abc123"
+        thread_id:
+          type: string
+          description: |
+            The conversation thread ID. This identifies the persistent conversation in
+            MongoDB. Follow-up messages reuse this thread. The thread contains the full
+            message history (user, assistant, tool, system messages).
+          example: "thread_1711234567_sf1"
+        status:
+          type: string
+          enum: [queued]
+          description: |
+            Always `"queued"` on creation. Transitions to `"running"` once the ReAct
+            loop starts, then to `"completed"`, `"failed"`, or `"cancelled"`.
+        label:
+          type: string
+          description: The human-readable label for this task.
+          example: "Research Salesforce"
+        created_at:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp of when the task was created.
+
+    CreateSubagentBatchResponse:
+      type: object
+      required: [agents]
+      properties:
+        agents:
+          type: array
+          description: |
+            One entry per agent in the batch, in the same order as the request. Each
+            entry includes the caller-assigned `id` for correlation.
+          items:
+            type: object
+            required: [id, task_id, thread_id, status, created_at]
+            properties:
+              id:
+                type: string
+                description: The caller-assigned correlation ID from the request.
+                example: "sf"
+              task_id:
+                type: string
+                example: "sa_1711234567_abc123"
+              thread_id:
+                type: string
+                example: "thread_1711234567_sf1"
+              status:
+                type: string
+                enum: [queued]
+              label:
+                type: string
+                example: "Salesforce Research"
+              created_at:
+                type: string
+                format: date-time
+
+    SubagentTask:
+      type: object
+      description: |
+        Full representation of a subagent task. Stored in MongoDB. Progress updates
+        come from Firestore (real-time) and are merged into this response.
+      required: [task_id, thread_id, status, response_consumed, created_at]
+      properties:
+        task_id:
+          type: string
+          description: Unique task identifier.
+          example: "sa_1711234567_abc123"
+        thread_id:
+          type: string
+          description: Conversation thread ID in MongoDB.
+          example: "thread_1711234567_sf1"
+        label:
+          type: string
+          description: Human-readable task label.
+          example: "Research Salesforce"
+        status:
+          type: string
+          enum: [queued, running, completed, failed, cancelled]
+          description: |
+            Current task status:
+            - `queued`: Created but ReAct loop has not started yet
+            - `running`: ReAct loop is actively executing turns
+            - `completed`: ReAct loop finished successfully. Response available via
+              `GET /api/subagents/{id}/response`
+            - `failed`: ReAct loop encountered an unrecoverable error. See `error` field
+            - `cancelled`: Task was cancelled via `DELETE /api/subagents/{id}`
+        progress:
+          $ref: '#/components/schemas/SubagentProgress'
+        response_consumed:
+          type: boolean
+          description: |
+            Whether the response has been retrieved via `GET /api/subagents/{id}/response`.
+            `false` means the result is unread. Useful for showing "unread" badges in the UI.
+        error:
+          type: string
+          nullable: true
+          description: |
+            Error description if `status` is `"failed"`. Null otherwise. Contains a
+            human-readable explanation of what went wrong (e.g., "Notion OAuth token not
+            found", "Max turns exceeded without resolution", "API rate limit hit").
+        persona_id:
+          type: string
+          nullable: true
+          description: The persona ID used for this subagent's system prompt.
+        parent_thread_id:
+          type: string
+          nullable: true
+          description: |
+            The thread ID of the primary conversation that spawned this subagent. Null
+            if the subagent was created directly by the user (not from another agent).
+        tokens:
+          $ref: '#/components/schemas/TokenUsage'
+        created_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the ReAct loop started. Null if still `queued`.
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the task reached a terminal state. Null if still running.
+
+    SubagentProgress:
+      type: object
+      nullable: true
+      description: |
+        Real-time progress from the subagent's ReAct loop. Updated every ~2 seconds
+        via Firestore. The `message` field is a human-readable description of what the
+        agent is currently doing (e.g., "Searching Tavily for pricing data...",
+        "Calling Notion API...", "Summarizing findings...").
+      properties:
+        turn:
+          type: integer
+          description: Current turn number (1-indexed).
+          example: 5
+        max_turns:
+          type: integer
+          description: Maximum turns allowed for this subagent.
+          example: 30
+        message:
+          type: string
+          description: |
+            Human-readable description of the agent's current activity. Updated at
+            each turn. Shows "Completed." when done, "Failed." on error.
+          example: "Searching Tavily for Salesforce Enterprise pricing..."
+        updated_at:
+          type: string
+          format: date-time
+          description: When this progress snapshot was last written.
+
+    SubagentResponsePayload:
+      type: object
+      description: |
+        Full subagent task outputs. Contains the task metadata envelope, the final
+        deliverable text, the structured assessment, and a paginated window of the
+        conversation thread messages (the entire subagent journey).
+      required: [task_id, thread_id, status, response, response_consumed, tokens, max_turns, created_at, completed_at, messages, pagination]
+      properties:
+        task_id:
+          type: string
+          example: "sa_1711234567_abc123"
+        thread_id:
+          type: string
+          example: "thread_1711234567_sf1"
+        label:
+          type: string
+          example: "Research Salesforce"
+        status:
+          type: string
+          enum: [completed, failed, cancelled]
+          description: Terminal status of the subagent task.
+        response:
+          type: string
+          nullable: true
+          description: |
+            The final deliverable text. Extracted from the `deliver_final_response`
+            tool call content in the thread, or from `SubagentTask.result` for older
+            runs. Never truncated. May contain markdown.
+        response_consumed:
+          type: boolean
+          description: |
+            `true` after the first retrieval. On the first call, this transitions from
+            `false` to `true`. Subsequent calls return `true` with no additional side
+            effects.
+        assessment:
+          type: object
+          nullable: true
+          description: |
+            Structured assessment from `submit_run_assessment`, if the subagent called
+            it. Contains status, summary, outputs, errors, and follow-up metadata.
+        tokens:
+          $ref: '#/components/schemas/TokenUsage'
+        turns_used:
+          type: integer
+          nullable: true
+          description: How many ReAct loop turns the subagent actually used.
+          example: 12
+        max_turns:
+          type: integer
+          description: The max turns limit that was set for this subagent.
+          example: 30
+        created_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+        delivered_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            When the response was first retrieved. Set on the first call to this
+            endpoint. On subsequent calls, shows the original delivery timestamp.
+        messages:
+          type: array
+          description: |
+            Paginated window of the conversation thread. Contains messages in
+            chronological order: user messages, assistant messages (with tool_calls),
+            tool result messages, and system messages. Use `offset` and `limit` query
+            parameters to page through the full thread. No individual message content
+            is truncated.
+          items:
+            $ref: '#/components/schemas/ConversationMessage'
+        lessons_learned:
+          $ref: '#/components/schemas/LessonsLearned'
+        pagination:
+          $ref: '#/components/schemas/Pagination'
+
+    LessonsLearned:
+      type: object
+      nullable: true
+      description: |
+        Lessons learned from this run, sourced from deterministic storage on the
+        SubagentTask document. Includes the structured assessment summary, error
+        resolutions, API server observations, efficiency findings, and recommended
+        changes. Present in every paginated response. By default, long text fields
+        are truncated to 100 characters; set `include_lessons_learned=true` to get
+        the full untruncated data.
+      properties:
+        assessment_summary:
+          type: string
+          nullable: true
+          description: Concise summary of what was accomplished.
+        assessment_outputs:
+          type: array
+          nullable: true
+          items:
+            type: object
+            properties:
+              type: { type: string, enum: [data, action, report, notification] }
+              description: { type: string }
+              detail: { type: string }
+        assessment_errors:
+          type: array
+          nullable: true
+          items:
+            type: object
+            properties:
+              description: { type: string }
+              severity: { type: string, enum: [blocking, non_blocking] }
+              attempted_resolution: { type: string }
+        assumptions_made:
+          type: array
+          nullable: true
+          items: { type: string }
+        follow_up_needed:
+          type: boolean
+          nullable: true
+        follow_up_reason:
+          type: string
+          nullable: true
+        api_servers_used:
+          type: array
+          nullable: true
+          items: { type: string }
+          description: API servers used during this run.
+        efficiency_status:
+          type: string
+          nullable: true
+          enum: [improvement_found, no_further_tweaking_required]
+        efficiency_next_run:
+          type: string
+          nullable: true
+          description: What should change on the next run.
+        errors_encountered:
+          type: array
+          nullable: true
+          description: Detailed error learnings with resolutions.
+          items:
+            type: object
+            properties:
+              api_server: { type: string }
+              error_description: { type: string }
+              root_cause: { type: string }
+              resolution: { type: string }
+        api_server_observations:
+          type: array
+          nullable: true
+          description: Non-obvious server-specific observations worth remembering.
+          items:
+            type: object
+            properties:
+              api_server: { type: string }
+              observation: { type: string }
+        recommended_api_servers:
+          type: array
+          nullable: true
+          description: New API servers that would improve future runs.
+          items:
+            type: object
+            properties:
+              api_server: { type: string }
+              reason: { type: string }
+        run_history_review_status:
+          type: integer
+          nullable: true
+          enum: [0, 1]
+          description: 0 if run history was reviewed, 1 if skipped.
+        learnings_recorded_at:
+          type: string
+          format: date-time
+          nullable: true
+
+    Pagination:
+      type: object
+      description: Stateless pagination metadata for paginated array responses.
+      required: [offset, limit, total, has_more]
+      properties:
+        offset:
+          type: integer
+          description: Number of items skipped from the start.
+          example: 0
+        limit:
+          type: integer
+          description: Page size used for this request.
+          example: 50
+        total:
+          type: integer
+          description: Total number of items in the full collection.
+          example: 127
+        has_more:
+          type: boolean
+          description: Whether more items exist beyond this page.
+          example: true
+
+    CancelSubagentResponse:
+      type: object
+      required: [task_id, status, previous_status]
+      properties:
+        task_id:
+          type: string
+          example: "sa_1711234567_abc123"
+        status:
+          type: string
+          enum: [cancelled, completed, failed]
+          description: |
+            The current status after the cancel operation. `"cancelled"` if the cancel
+            succeeded. `"completed"` or `"failed"` if the subagent had already reached
+            a terminal state (no-op).
+        previous_status:
+          type: string
+          enum: [queued, running, completed, failed, cancelled]
+          description: The status before the cancel request was processed.
+        cancelled_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Timestamp of the cancellation. Null if the subagent was already in a
+            terminal state (no cancellation occurred).
+
+    SendMessageResponse:
+      type: object
+      required: [task_id, thread_id, status]
+      properties:
+        task_id:
+          type: string
+          description: Same task ID — the follow-up reuses the existing task.
+          example: "sa_1711234567_abc123"
+        thread_id:
+          type: string
+          description: Same thread ID — the message is appended to the existing thread.
+          example: "thread_1711234567_sf1"
+        status:
+          type: string
+          enum: [queued]
+          description: Always `"queued"` — the follow-up fires-and-forgets.
+        message:
+          type: string
+          description: Human-readable confirmation.
+          example: "Follow-up message queued. The subagent will process it with full conversation context."
+
+    ListSubagentsResponse:
+      type: object
+      required: [tasks, has_more]
+      properties:
+        tasks:
+          type: array
+          description: Array of subagent tasks, sorted by creation time (most recent first).
+          items:
+            $ref: '#/components/schemas/SubagentTask'
+        has_more:
+          type: boolean
+          description: |
+            `true` if there are more results beyond this page. Use the `task_id` of the
+            last item as the `cursor` query parameter to fetch the next page.
+        next_cursor:
+          type: string
+          nullable: true
+          description: |
+            The `task_id` to pass as the `cursor` parameter for the next page. Null if
+            there are no more results.
+
+    # ── Scheduled Task Schemas ──
+
+    CreateScheduledTaskRequest:
+      type: object
+      required: [prompt, schedule]
+      properties:
+        prompt:
+          type: string
+          description: |
+            The task prompt that will be executed on each scheduled run. Be specific —
+            this becomes the user message in an autonomous subagent conversation.
+            The subagent executes a full ReAct loop to fulfill this prompt.
+          example: "Pull last week's QuickBooks transactions, summarize by category, and write the report to a Google Sheet."
+        schedule:
+          type: string
+          description: |
+            Cron expression (5-field syntax: minute hour day-of-month month day-of-week).
+            Examples:
+            - `0 9 * * 1` — every Monday at 9:00 AM
+            - `0 */6 * * *` — every 6 hours
+            - `30 17 1 * *` — 1st of every month at 5:30 PM
+            - `0 8 * * 1-5` — weekdays at 8:00 AM
+          example: "0 9 * * 1"
+        timezone:
+          type: string
+          nullable: true
+          default: "UTC"
+          description: |
+            IANA timezone for interpreting the cron expression. Defaults to UTC.
+            Examples: `America/New_York`, `Europe/London`, `Asia/Tokyo`.
+          example: "America/New_York"
+        persona_id:
+          type: string
+          nullable: true
+          description: |
+            The persona ID to use for the subagent's system prompt on each run.
+            If omitted, uses the platform default persona.
+          example: "ledgerbot"
+        required_api_servers:
+          type: array
+          nullable: true
+          items:
+            type: string
+          description: |
+            List of API server names that must be connected for this task to succeed.
+            If any are not connected at execution time, the task fails immediately with
+            a clear error rather than producing a partial result. Use `list_api_servers`
+            to discover available server names.
+          example: ["quickbooks", "google-sheets"]
+        label:
+          type: string
+          nullable: true
+          description: |
+            Short human-readable label for this scheduled task. Displayed in the UI
+            and logs. If omitted, auto-generated from the first ~60 characters of the prompt.
+          example: "Weekly Finance Summary"
+        description:
+          type: string
+          nullable: true
+          description: |
+            Longer description of what this scheduled task does. For documentation
+            and UI display. Optional.
+        enabled:
+          type: boolean
+          default: true
+          description: |
+            Whether the task is active. Set to `false` to pause the schedule without
+            deleting it. Defaults to `true`.
+        max_turns:
+          type: integer
+          nullable: true
+          default: 30
+          minimum: 1
+          maximum: 50
+          description: |
+            Maximum ReAct loop turns per execution. Default 30. Hard cap 50.
+
+    UpdateScheduledTaskRequest:
+      type: object
+      description: |
+        Partial update. Only provided fields are changed. Immutable fields
+        (`scheduled_task_id`, `user_id`, `instance_id`, `run_count`, `last_run`)
+        are ignored if included.
+      properties:
+        prompt:
+          type: string
+          description: Updated task prompt.
+        schedule:
+          type: string
+          description: Updated cron expression. Triggers `next_run_at` recalculation.
+        timezone:
+          type: string
+          description: Updated IANA timezone. Triggers `next_run_at` recalculation.
+        persona_id:
+          type: string
+          nullable: true
+          description: Updated persona ID.
+        required_api_servers:
+          type: array
+          nullable: true
+          items:
+            type: string
+          description: Updated list of required API servers.
+        label:
+          type: string
+          description: Updated label.
+        description:
+          type: string
+          nullable: true
+          description: Updated description.
+        enabled:
+          type: boolean
+          description: Enable or disable the schedule.
+        max_turns:
+          type: integer
+          minimum: 1
+          maximum: 50
+          description: Updated max turns per execution.
+
+    ScheduledTaskResponse:
+      type: object
+      description: |
+        Full representation of a scheduled task. Includes schedule configuration,
+        the latest execution result (if any), and next run time.
+      required: [scheduled_task_id, user_id, prompt, schedule, timezone, enabled, run_count, created_at, updated_at]
+      properties:
+        scheduled_task_id:
+          type: string
+          description: Unique identifier for this scheduled task.
+          example: "scht_1711234567_abc123"
+        user_id:
+          type: string
+          description: Owner user ID.
+        prompt:
+          type: string
+          description: The task prompt executed on each run.
+        persona_id:
+          type: string
+          nullable: true
+          description: Persona used for execution.
+        required_api_servers:
+          type: array
+          nullable: true
+          items:
+            type: string
+          description: API servers required for execution.
+        schedule:
+          type: string
+          description: Cron expression.
+          example: "0 9 * * 1"
+        timezone:
+          type: string
+          description: IANA timezone.
+          example: "America/New_York"
+        enabled:
+          type: boolean
+          description: Whether the schedule is active.
+        label:
+          type: string
+          nullable: true
+          description: Human-readable label.
+        description:
+          type: string
+          nullable: true
+        max_turns:
+          type: integer
+          description: Max ReAct turns per execution.
+        next_run_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Computed next execution time.
+        last_executed_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: When the task last ran.
+        run_count:
+          type: integer
+          description: Total number of times this task has executed.
+        last_run:
+          type: object
+          nullable: true
+          description: |
+            Result of the most recent execution. Null if the task has never run.
+            Overwritten on each execution — only the latest result is retained here.
+            Full execution history lives on the SubagentTask documents (queryable via
+            `GET /api/subagents` filtered by the `task_id` from `last_run`).
+          properties:
+            status:
+              type: string
+              enum: [done, failed]
+              description: Whether the last run succeeded or failed.
+            output:
+              type: string
+              nullable: true
+              description: Full result text from a successful run.
+            error:
+              type: string
+              nullable: true
+              description: Error message from a failed run.
+            task_id:
+              type: string
+              nullable: true
+              description: The subagent task_id for this execution.
+            started_at:
+              type: string
+              format: date-time
+            completed_at:
+              type: string
+              format: date-time
+            duration_ms:
+              type: integer
+              nullable: true
+              description: Execution duration in milliseconds.
+        created_at:
+          type: string
+          format: date-time
+        updated_at:
+          type: string
+          format: date-time
+
+    ListScheduledTasksResponse:
+      type: object
+      required: [scheduled_tasks]
+      properties:
+        scheduled_tasks:
+          type: array
+          description: Array of scheduled tasks, sorted by creation time (most recent first).
+          items:
+            $ref: '#/components/schemas/ScheduledTaskResponse'
+
+    # ── Notification Schemas ──
+
+    PushNotificationRequest:
+      type: object
+      required: [type, source, summary]
+      properties:
+        type:
+          type: string
+          description: |
+            The event type. Extensible — any string is valid. Convention uses
+            dot-separated namespaces: `subagent.completed`, `slack.message`,
+            `webhook.received`, `schedule.completed`, etc.
+
+            The notification service accepts any type string. No server-side
+            validation on the type value itself — just JWT auth on the endpoint.
+          example: "subagent.completed"
+        source:
+          type: string
+          description: |
+            Identifies the origin of the notification. Convention: `{type}:{identifier}`.
+            Examples: `subagent:sa_abc123`, `slack:C04ABCDEF`, `webhook:github`,
+            `schedule:sched_xyz`. Used for origin validation and UI grouping.
+          example: "subagent:sa_1711234567_abc123"
+        priority:
+          type: string
+          enum: [low, normal, high, urgent]
+          default: "normal"
+          description: |
+            Notification priority. Affects UI presentation (badge color, sort order)
+            and behavior:
+            - `low`: Informational. No badge highlight.
+            - `normal`: Standard notification. Badge count increments.
+            - `high`: Emphasized in UI. May trigger a toast/sound.
+            - `urgent`: If auto-mode is ON and no loop is running, this priority
+              may auto-trigger a new ReAct loop turn.
+        summary:
+          type: string
+          description: |
+            Short, human-readable summary of the event. This text is injected into
+            the primary agent's ReAct loop as part of a system message. Keep it
+            concise (1-2 sentences). The agent can retrieve full details via
+            `payload_url` if provided.
+          example: "Subagent 'Research Salesforce' completed successfully."
+        payload_ref:
+          type: string
+          nullable: true
+          description: |
+            An identifier for fetching the full content associated with this
+            notification. For subagent notifications, this is the `task_id`. For
+            other types, it could be a webhook event ID, a message ID, etc.
+            Used for origin validation (e.g., verifying the referenced subagent
+            task belongs to this user).
+          example: "sa_1711234567_abc123"
+        payload_url:
+          type: string
+          nullable: true
+          description: |
+            The API endpoint where the full content can be retrieved. Injected
+            into the system message so the agent knows where to fetch details.
+            Can be a relative path (resolved against the subagent API base URL)
+            or an absolute URL.
+          example: "/api/subagents/sa_1711234567_abc123/response"
+        expires_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: |
+            Optional expiration timestamp. If set, the notification is automatically
+            considered expired after this time and will not be delivered to the ReAct
+            loop. Default: no expiration (pending notifications persist indefinitely
+            until consumed).
+
+    PushNotificationResponse:
+      type: object
+      required: [notification_id, created_at]
+      properties:
+        notification_id:
+          type: string
+          description: |
+            Unique identifier for the created notification. Use this ID to
+            manually acknowledge the notification via
+            `POST /api/notifications/{id}/ack`. The notification now exists in
+            Firestore at `/notifications/{userId}/pending/{notification_id}`.
+          example: "notif_1711234800_a1b2c3d4"
+        created_at:
+          type: string
+          format: date-time
+          description: ISO 8601 timestamp of when the notification was created.
+
+    ListNotificationsResponse:
+      type: object
+      required: [notifications, count]
+      properties:
+        notifications:
+          type: array
+          description: |
+            Array of pending notifications, sorted by creation time (oldest first).
+            Oldest first because the ReAct loop processes them in FIFO order.
+          items:
+            $ref: '#/components/schemas/AgentNotification'
+        count:
+          type: integer
+          description: Total number of pending notifications returned.
+
+    AgentNotification:
+      type: object
+      description: |
+        A notification in the pending queue. Written to Firestore at
+        `/notifications/{userId}/pending/{notificationId}`. Deleted from Firestore
+        when consumed by the ReAct loop or manually acknowledged. Presence in the
+        collection means pending. Absence means consumed. There is no "delivered"
+        state in Firestore — the document is simply gone.
+      required: [notification_id, type, source, priority, summary, created_at]
+      properties:
+        notification_id:
+          type: string
+          description: Unique notification identifier.
+          example: "notif_1711234800_a1b2c3d4"
+        type:
+          type: string
+          description: Event type (dot-separated namespace).
+          example: "subagent.completed"
+        source:
+          type: string
+          description: Origin identifier.
+          example: "subagent:sa_1711234567_abc123"
+        priority:
+          type: string
+          enum: [low, normal, high, urgent]
+          example: "normal"
+        summary:
+          type: string
+          description: Human-readable event summary.
+          example: "Subagent 'Research Salesforce' completed successfully."
+        payload_ref:
+          type: string
+          nullable: true
+          description: Reference ID for fetching full content.
+          example: "sa_1711234567_abc123"
+        payload_url:
+          type: string
+          nullable: true
+          description: API endpoint for full content retrieval.
+          example: "/api/subagents/sa_1711234567_abc123/response"
+        created_at:
+          type: string
+          format: date-time
+
+    AcknowledgeNotificationResponse:
+      type: object
+      required: [notification_id, acknowledged]
+      properties:
+        notification_id:
+          type: string
+          example: "notif_1711234800_a1b2c3d4"
+        acknowledged:
+          type: boolean
+          description: Always `true` — the operation is idempotent.
+        already_consumed:
+          type: boolean
+          description: |
+            `true` if the notification was already consumed (by the ReAct loop or
+            a prior ack call). `false` if this call actually deleted it from Firestore.
+
+    # ── Shared Schemas ──
+
+    TokenUsage:
+      type: object
+      description: Cumulative token usage for the subagent's conversation thread.
+      properties:
+        input:
+          type: integer
+          description: Total input (prompt) tokens consumed.
+          example: 42000
+        output:
+          type: integer
+          description: Total output (completion) tokens consumed.
+          example: 18000
+        total:
+          type: integer
+          description: Sum of input + output tokens.
+          example: 60000
+
+    ConversationMessage:
+      type: object
+      description: |
+        A single message in the conversation thread. Same shape as the messages
+        used in the main chat API. Follows the OpenAI chat completion message format.
+      required: [role, content]
+      properties:
+        role:
+          type: string
+          enum: [system, user, assistant, tool]
+          description: |
+            The role of the message author:
+            - `system`: System prompt or injected context (e.g., notifications)
+            - `user`: The original prompt or follow-up message
+            - `assistant`: The agent's response (may include `tool_calls`)
+            - `tool`: The result of a tool execution (paired with a `tool_call_id`)
+        content:
+          type: string
+          nullable: true
+          description: |
+            The text content of the message. Null for assistant messages that only
+            contain tool calls.
+        tool_calls:
+          type: array
+          nullable: true
+          description: |
+            Tool calls made by the assistant in this message. Only present on
+            `assistant` messages. Each tool call has an ID that corresponds to a
+            subsequent `tool` message's `tool_call_id`.
+          items:
+            type: object
+            properties:
+              id:
+                type: string
+                description: Unique tool call ID.
+              type:
+                type: string
+                enum: [function]
+              function:
+                type: object
+                properties:
+                  name:
+                    type: string
+                    description: The name of the tool/function called.
+                  arguments:
+                    type: string
+                    description: JSON string of the function arguments.
+        tool_call_id:
+          type: string
+          nullable: true
+          description: |
+            For `tool` role messages only. The ID of the tool call this result
+            corresponds to.
+
+    ErrorResponse:
+      type: object
+      required: [error, message]
+      properties:
+        error:
+          type: string
+          description: |
+            Machine-readable error code. Use this for programmatic error handling.
+            Examples: `"validation_error"`, `"not_found"`, `"concurrent_limit_exceeded"`,
+            `"not_completed"`, `"still_running"`, `"origin_validation_failed"`,
+            `"unauthorized"`.
+        message:
+          type: string
+          description: |
+            Human-readable error message with enough context to understand and
+            resolve the issue. The primary agent can present this directly to the user.
+
+  responses:
+    BadRequest:
+      description: |
+        Invalid request body or parameters. The `message` field describes what
+        is wrong. Common causes: missing required fields, invalid `max_turns` value
+        (must be 1-50), empty `prompt`, or invalid `personaId`.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: "validation_error"
+            message: "Field 'prompt' is required and must be a non-empty string."
+    Unauthorized:
+      description: |
+        Missing or invalid JWT. Include a valid Bearer token in the `Authorization`
+        header. The token must not be expired.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: "unauthorized"
+            message: "Missing or invalid Authorization header. Provide a valid Bearer JWT."
+    NotFound:
+      description: |
+        The requested subagent task does not exist or does not belong to the
+        authenticated user. Verify the `task_id` is correct.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: "not_found"
+            message: "Subagent task sa_1711234567_abc123 not found."
