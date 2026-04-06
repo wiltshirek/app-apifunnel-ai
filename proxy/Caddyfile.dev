@@ -1,0 +1,26 @@
+# Local development — HTTP only on :3000
+:3000 {
+    handle /internal/assets/* {
+        reverse_proxy localhost:3002
+    }
+    handle /api/v1/assets/* {
+        reverse_proxy localhost:3002
+    }
+    handle /v1/* {
+        reverse_proxy localhost:3001
+    }
+    handle /graphiti/* {
+        uri strip_prefix /graphiti
+        reverse_proxy localhost:8001
+    }
+    handle /health {
+        reverse_proxy localhost:3001
+    }
+    handle /health/lakehouse {
+        rewrite * /health
+        reverse_proxy localhost:3002
+    }
+    handle {
+        reverse_proxy localhost:3001
+    }
+}

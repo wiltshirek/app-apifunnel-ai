@@ -1,0 +1,39 @@
+# api.apifunnel.ai — reverse proxy for all platform services
+#
+# Caddy handles TLS (Let's Encrypt) automatically.
+# Path-based routing sends traffic to the correct backend.
+
+api.apifunnel.ai {
+    # ── Lakehouse (Python :3002) ──────────────────────────────────
+    handle /internal/assets/* {
+        reverse_proxy localhost:3002
+    }
+    handle /api/v1/assets/* {
+        reverse_proxy localhost:3002
+    }
+
+    # ── Orchestration (Node :3001) ────────────────────────────────
+    handle /v1/* {
+        reverse_proxy localhost:3001
+    }
+
+    # ── Graphiti adapter (optional, :8001) ────────────────────────
+    handle /graphiti/* {
+        uri strip_prefix /graphiti
+        reverse_proxy localhost:8001
+    }
+
+    # ── Health checks (both services) ─────────────────────────────
+    handle /health {
+        reverse_proxy localhost:3001
+    }
+    handle /health/lakehouse {
+        rewrite * /health
+        reverse_proxy localhost:3002
+    }
+
+    # ── Catch-all → orchestration ─────────────────────────────────
+    handle {
+        reverse_proxy localhost:3001
+    }
+}

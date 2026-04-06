@@ -1,0 +1,28 @@
+services:
+  orchestration:
+    build: services/orchestration
+    ports:
+      - "3001:3001"
+    env_file: .env
+    environment:
+      PORT: "3001"
+      NODE_ENV: development
+    restart: unless-stopped
+
+  lakehouse:
+    build: services/lakehouse
+    ports:
+      - "3002:3002"
+    env_file: .env
+    restart: unless-stopped
+
+  caddy:
+    image: caddy:2-alpine
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./proxy/Caddyfile.dev:/etc/caddy/Caddyfile:ro
+    depends_on:
+      - orchestration
+      - lakehouse
+    restart: unless-stopped

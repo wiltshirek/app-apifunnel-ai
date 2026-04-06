@@ -1,0 +1,166 @@
+name: Deploy to Hetzner
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+jobs:
+  detect-changes:
+    runs-on: ubuntu-latest
+    outputs:
+      orchestration: ${{ steps.check.outputs.orchestration }}
+      lakehouse: ${{ steps.check.outputs.lakehouse }}
+      proxy: ${{ steps.check.outputs.proxy }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - id: check
+        run: |
+          BEFORE="${{ github.event.before }}"
+          EVENT="${{ github.event_name }}"
+
+          if [ "$EVENT" = "workflow_dispatch" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+            echo "⚡ Full deploy (manual trigger or first push)"
+            echo "orchestration=true" >> $GITHUB_OUTPUT
+            echo "lakehouse=true"     >> $GITHUB_OUTPUT
+            echo "proxy=true"         >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          CHANGED=$(git diff --name-only "$BEFORE" "${{ github.sha }}" 2>/dev/null || echo "FORCE_ALL")
+          echo "Changed files:"
+          echo "$CHANGED"
+
+          if echo "$CHANGED" | grep -q "FORCE_ALL"; then
+            echo "orchestration=true" >> $GITHUB_OUTPUT
+            echo "lakehouse=true"     >> $GITHUB_OUTPUT
+            echo "proxy=true"         >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "orchestration=$(echo "$CHANGED" | grep -qE '^services/orchestration/' && echo true || echo false)" >> $GITHUB_OUTPUT
+          echo "lakehouse=$(echo "$CHANGED" | grep -qE '^services/lakehouse/' && echo true || echo false)"         >> $GITHUB_OUTPUT
+          echo "proxy=$(echo "$CHANGED" | grep -qE '^proxy/' && echo true || echo false)"                           >> $GITHUB_OUTPUT
+
+  deploy:
+    needs: detect-changes
+    if: >
+      needs.detect-changes.outputs.orchestration == 'true' ||
+      needs.detect-changes.outputs.lakehouse == 'true' ||
+      needs.detect-changes.outputs.proxy == 'true'
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Hetzner CLI
+        run: |
+          curl -sL https://github.com/hetznercloud/cli/releases/latest/download/hcloud-linux-amd64.tar.gz | tar xvz
+          sudo mv hcloud /usr/local/bin/
+
+      - name: Resolve Hetzner node IP
+        env:
+          HCLOUD_TOKEN: ${{ secrets.HETZNER_API_TOKEN }}
+        run: |
+          NODE_IP=$(hcloud server list -l role=api-platform --status running -o noheader -o 'columns=ipv4' | head -1 | tr -d '[:space:]')
+          if [ -z "$NODE_IP" ]; then
+            echo "❌ No running node with label role=api-platform"
+            exit 1
+          fi
+          echo "NODE_IP=$NODE_IP" >> $GITHUB_ENV
+          echo "🚀 Deploying to $NODE_IP"
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.DEPLOY_SSH_KEY }}" > ~/.ssh/key
+          chmod 600 ~/.ssh/key
+          ssh-keyscan -H "$NODE_IP" >> ~/.ssh/known_hosts 2>/dev/null
+
+      - name: Write production .env on server
+        run: |
+          SSH="ssh -i ~/.ssh/key -o StrictHostKeyChecking=no root@$NODE_IP"
+
+          $SSH "mkdir -p /opt/api-apifunnel"
+
+          $SSH "cat > /opt/api-apifunnel/.env << 'ENVEOF'
+          NODE_ENV=production
+          PORT=3001
+
+          MONGODB_URI=${{ secrets.MONGODB_URI }}
+
+          LAKEHOUSE_MONGODB_URI=${{ secrets.LAKEHOUSE_MONGODB_URI }}
+          LAKEHOUSE_DB_NAME=mcp_code_execution_server
+
+          JWT_SECRET=${{ secrets.JWT_SECRET }}
+          MCP_ADMIN_KEY=${{ secrets.MCP_ADMIN_KEY }}
+          CRON_SECRET=${{ secrets.CRON_SECRET }}
+
+          FIREBASE_PROJECT_ID=${{ secrets.FIREBASE_PROJECT_ID }}
+          FIREBASE_CLIENT_EMAIL=${{ secrets.FIREBASE_CLIENT_EMAIL }}
+          FIREBASE_PRIVATE_KEY=\"${{ secrets.FIREBASE_PRIVATE_KEY }}\"
+
+          APP_BASE_URL=${{ secrets.APP_BASE_URL }}
+          GRAPHITI_SERVICE_URL=${{ secrets.GRAPHITI_SERVICE_URL }}
+
+          HETZNER_S3_ENDPOINT=${{ secrets.HETZNER_S3_ENDPOINT }}
+          HETZNER_S3_ACCESS_KEY=${{ secrets.HETZNER_S3_ACCESS_KEY }}
+          HETZNER_S3_SECRET=${{ secrets.HETZNER_S3_SECRET }}
+          HETZNER_S3_REGION=${{ secrets.HETZNER_S3_REGION }}
+          HETZNER_S3_ASSETS_BUCKET=${{ secrets.HETZNER_S3_ASSETS_BUCKET }}
+          ENVEOF"
+
+          echo "✅ .env written"
+
+      - name: Deploy orchestration
+        if: needs.detect-changes.outputs.orchestration == 'true'
+        run: |
+          SSH="ssh -i ~/.ssh/key -o StrictHostKeyChecking=no root@$NODE_IP"
+          SCP="scp -i ~/.ssh/key -o StrictHostKeyChecking=no -r"
+
+          echo "📦 Syncing orchestration..."
+          $SSH "mkdir -p /opt/api-apifunnel/services/orchestration"
+          $SCP services/orchestration/package.json services/orchestration/package-lock.json services/orchestration/tsconfig.json "root@$NODE_IP:/opt/api-apifunnel/services/orchestration/"
+          $SCP services/orchestration/src "root@$NODE_IP:/opt/api-apifunnel/services/orchestration/"
+          $SCP services/orchestration/openapi "root@$NODE_IP:/opt/api-apifunnel/services/orchestration/"
+
+          $SSH "cd /opt/api-apifunnel/services/orchestration && npm ci --production=false && npm run build"
+          $SSH "cd /opt/api-apifunnel && pm2 restart orchestration --update-env 2>/dev/null || pm2 start services/orchestration/dist/index.js --name orchestration --env-file .env --max-memory-restart 512M"
+          echo "✅ Orchestration deployed"
+
+      - name: Deploy lakehouse
+        if: needs.detect-changes.outputs.lakehouse == 'true'
+        run: |
+          SSH="ssh -i ~/.ssh/key -o StrictHostKeyChecking=no root@$NODE_IP"
+          SCP="scp -i ~/.ssh/key -o StrictHostKeyChecking=no -r"
+
+          echo "📦 Syncing lakehouse..."
+          $SSH "mkdir -p /opt/api-apifunnel/services/lakehouse"
+          $SCP services/lakehouse/pyproject.toml "root@$NODE_IP:/opt/api-apifunnel/services/lakehouse/"
+          $SCP services/lakehouse/src "root@$NODE_IP:/opt/api-apifunnel/services/lakehouse/"
+
+          $SSH "cd /opt/api-apifunnel/services/lakehouse && pip install --no-cache-dir -q ."
+          $SSH "cd /opt/api-apifunnel && pm2 restart lakehouse --update-env 2>/dev/null || pm2 start 'uvicorn src.main:app --host 0.0.0.0 --port 3002 --workers 2' --name lakehouse --cwd services/lakehouse --interpreter none --max-memory-restart 512M"
+          echo "✅ Lakehouse deployed"
+
+      - name: Sync Caddy config
+        if: needs.detect-changes.outputs.proxy == 'true'
+        run: |
+          SSH="ssh -i ~/.ssh/key -o StrictHostKeyChecking=no root@$NODE_IP"
+          SCP="scp -i ~/.ssh/key -o StrictHostKeyChecking=no"
+
+          echo "🔄 Syncing Caddyfile..."
+          $SCP proxy/Caddyfile "root@$NODE_IP:/etc/caddy/Caddyfile"
+          $SSH "caddy reload --config /etc/caddy/Caddyfile 2>/dev/null || systemctl restart caddy"
+          echo "✅ Caddy reloaded"
+
+      - name: PM2 save + health check
+        run: |
+          SSH="ssh -i ~/.ssh/key -o StrictHostKeyChecking=no root@$NODE_IP"
+          $SSH "pm2 save"
+          sleep 5
+          $SSH "curl -sf http://localhost:3001/health && echo ' ✅ Orchestration OK' || echo ' ❌ Orchestration down'"
+          $SSH "curl -sf http://localhost:3002/health && echo ' ✅ Lakehouse OK' || echo ' ❌ Lakehouse down'"

@@ -1,301 +1,429 @@
-# API Server Handoff — MCP Team
+# Handoff: api-apifunnel-ai — Deployment Runbook
 
-**Repo**: `git@github.com:wiltshirek/app-apifunnel-ai.git`  
-**Runtime**: Node.js 20 + Hono framework  
-**Target host**: Hetzner (same box as Graphiti adapter)  
-**Port**: 3001 (Caddy proxies to `api.apifunnel.ai`)
+You are the local assistant for this monorepo. This document is your complete runbook. Execute it top-to-bottom. You have shell access, `gh` CLI, and the `.env` file already has real credentials.
 
----
-
-## What this project is
-
-A standalone REST API server that owns:
-
-- **Subagents** — launch, status, cancel, results, follow-up messages
-- **Scheduled Tasks** — CRUD, run history, run-now
-- **Notifications** — push / list / ack via Firestore
-- **Internal scheduler tick** — receives Vercel Cron call once per minute and dispatches due tasks
-
-It reads from the **same MongoDB database and Firebase project** as the main web app (`one-mcp/web`). No data migration, no new collections.
+**GitHub repo:** `wiltshirek/app-apifunnel-ai`
 
 ---
 
-## Getting started immediately
+## Architecture Overview
 
-All credentials are already in `.env` at the repo root. Just:
+```
+                        ┌─────────────────────────┐
+                        │   api.apifunnel.ai      │
+                        │   (Caddy reverse proxy)  │
+                        └────────┬────────────────┘
+                                 │
+              ┌──────────────────┼──────────────────┐
+              │                  │                   │
+   /v1/*  /health    /internal/assets/*      /graphiti/*
+   (catch-all)       /api/v1/assets/*        (optional)
+              │                  │                   │
+              ▼                  ▼                   ▼
+   ┌──────────────────┐ ┌──────────────────┐ ┌───────────┐
+   │  Orchestration   │ │    Lakehouse     │ │ Graphiti  │
+   │  Node.js (Hono)  │ │  Python (FastAPI)│ │ (adapter) │
+   │  :3001           │ │  :3002           │ │ :8001     │
+   └──────────────────┘ └──────────────────┘ └───────────┘
+              │                  │
+              ▼                  ▼
+   ┌──────────────────────────────────────────┐
+   │  MongoDB Atlas (same cluster)            │
+   │  ├── apifunnel (orchestration tables)    │
+   │  └── mcp_code_execution_server (assets)  │
+   └──────────────────────────────────────────┘
+```
+
+### Routing table
+
+| Path pattern             | Routed to    | Port |
+|--------------------------|------------- |------|
+| `/internal/assets/*`     | Lakehouse    | 3002 |
+| `/api/v1/assets/*`       | Lakehouse    | 3002 |
+| `/v1/*`                  | Orchestration| 3001 |
+| `/graphiti/*`            | Graphiti     | 8001 |
+| `/health`                | Orchestration| 3001 |
+| `/health/lakehouse`      | Lakehouse    | 3002 |
+| Everything else          | Orchestration| 3001 |
+
+---
+
+## Phase 1: Local Testing
+
+The `.env` at the repo root already has real credentials. Verify both services start and respond.
+
+### 1a. Install dependencies
 
 ```bash
-npm ci
-npm run dev        # dev with hot reload on port 3001
-# or
-npm run build && npm start   # production
+# Orchestration
+cd services/orchestration && npm install && cd ../..
+
+# Lakehouse (venv)
+cd services/lakehouse
+python3 -m venv .venv
+source .venv/bin/activate
+pip install -e ".[dev]"
+cd ../..
 ```
 
-The `.env` file is gitignored and pre-populated with real credentials copied from the web app. You should not need to look anything up.
-
-**One value you must set before going live:**
-
-```
-CRON_SECRET=change-me-set-same-in-vercel
-```
-
-Pick any strong random string, set it here, and set the same value in Vercel as `CRON_SECRET` on the `one-mcp/web` project. This authenticates the Vercel Cron call to `/v1/internal/scheduler-tick`.
-
----
-
-## Project structure
-
-```
-src/
-  index.ts                      ← Hono app entrypoint, port 3001
-  routes/
-    subagents.ts                ← POST/GET/DELETE + /:id/response + /:id/message
-    scheduled-tasks.ts          ← CRUD + /run-now + /runs + /runs/summary
-    notifications.ts            ← GET/POST + /:id/ack
-    internal.ts                 ← POST /scheduler-tick
-  lib/
-    db.ts                       ← MongoDB connection (mongoose)
-    jwt.ts                      ← verifyToken, getAuthFromRequest, mintAppJwt
-    auth-internal.ts            ← dual-auth: X-Admin-Key + Bearer JWT
-    firebase-admin.ts           ← Firestore Admin SDK
-    graphiti-runtime.ts         ← reads GRAPHITI_SERVICE_URL env var
-    subagent-runner.ts          ← SSE consumer, calls APP_BASE_URL/api/chat
-    notifications/              ← push, consume, format, types
-    learning-graph/             ← client (HTTP to Graphiti), record-run-learnings,
-                                   format-last-run-lessons
-    utils/schedule.ts           ← calculateNextRun, isValidCron, generateThreadId
-  models/
-    SubagentTask.ts             ← verbatim from one-mcp/web
-    ScheduledTask.ts            ← verbatim from one-mcp/web
-    ConversationThread.ts       ← verbatim from one-mcp/web
-openapi/
-  orchestration.yaml            ← full OpenAPI 3.1 spec, served at GET /v1/openapi.json
-.env                            ← real credentials (gitignored, pre-populated)
-.env.example                    ← template for reference
-```
-
----
-
-## Graphiti on Hetzner
-
-Graphiti is an HTTP adapter service. Run it on the **same Hetzner box** as this server.
-
-The env var `GRAPHITI_SERVICE_URL=http://localhost:8001` in `.env` is already set. When Graphiti is running on the box, learning graph calls (preload, ingest, query) will work automatically with zero code changes.
-
-If `GRAPHITI_SERVICE_URL` is unset or Graphiti is unreachable, all learning graph calls silently no-op — safe to leave during initial deployment.
-
-The web app (`one-mcp/web`) also calls Graphiti. Its `graphiti-runtime.ts` currently only enables it during `npm run dev`. Once Graphiti is hosted, make this change:
-
-**File**: `one-mcp/web/src/lib/graphiti-runtime.ts`
-
-Replace the entire file with:
-
-```ts
-export function getGraphitiUrl(): string | null {
-  return process.env.GRAPHITI_SERVICE_URL || null;
-}
-
-export function graphitiDisabledReason(): string {
-  return 'GRAPHITI_SERVICE_URL is not set';
-}
-```
-
-Then add to Vercel environment variables:
-```
-GRAPHITI_SERVICE_URL=https://api.apifunnel.ai/graphiti
-```
-
-And add a Caddy reverse proxy entry for that path (see Hetzner deployment section below).
-
----
-
-## What needs to change in `one-mcp/web` (the Vercel project)
-
-### 1. Retarget the Vercel Cron
-
-The web app's `vercel.json` cron currently calls its own internal route. Change it to call this server:
-
-**`one-mcp/web/vercel.json`** — find the scheduler-tick cron entry and change the path to an external fetch, or use a serverless function that forwards to:
-
-```
-POST https://api.apifunnel.ai/v1/internal/scheduler-tick
-Authorization: Bearer {CRON_SECRET}
-```
-
-The simplest approach: keep the cron pointed at `/api/internal/scheduler-tick` in the web app, but update that route handler to just proxy the call to the new server. Then delete it once confirmed stable.
-
-Once Vercel Cron is confirmed calling the new server correctly, delete:
-```
-one-mcp/web/src/app/api/internal/scheduler-tick/route.ts
-```
-
-### 2. Retarget `dispatch_subagent` platform tool
-
-**File**: `one-mcp/web/src/lib/platform-tools/handlers/dispatch-subagent.ts`
-
-Line 37 currently calls `${baseUrl}/api/subagents`. The `baseUrl` is passed in from the chat route and defaults to the same app. Change the fetch target to the new API server:
-
-```ts
-// Before (line 37)
-const res = await fetch(`${baseUrl}/api/subagents`, {
-
-// After
-const orchestrationUrl = process.env.ORCHESTRATION_API_URL || baseUrl
-const res = await fetch(`${orchestrationUrl}/v1/subagents`, {
-```
-
-Add to Vercel environment variables:
-```
-ORCHESTRATION_API_URL=https://api.apifunnel.ai
-```
-
-### 3. Fix `graphiti-runtime.ts` (described above)
-
-### 4. Update `payload_url` in subagent notifications
-
-**File**: `one-mcp/web/src/lib/subagent-runner.ts`
-
-The `pushNotification` call near the bottom sets a relative `payload_url`. Update to absolute:
-
-```ts
-// Before
-payload_url: `/api/subagents/${task_id}/response`  (if present)
-
-// After — in one-mcp/web/src/lib/subagent-runner.ts
-// No payload_url is currently set in this file — the new server's
-// src/lib/subagent-runner.ts also omits it. Leave as-is for now.
-// The agent uses get_subagent_status which knows the correct base URL.
-```
-
-This is low priority — the agent resolves the payload via `task_id` regardless.
-
----
-
-## Add your Lakehouse endpoints
-
-Create `src/routes/lakehouse.ts` using the same pattern as any other route:
-
-```ts
-import { Hono } from 'hono';
-import { connectDB } from '../lib/db';
-import { authenticateInternalRequest } from '../lib/auth-internal';
-
-export const lakhouseRouter = new Hono();
-
-lakhouseRouter.get('/assets', async (c) => {
-  await connectDB();
-  const auth = authenticateInternalRequest(c.req.raw);
-  if (!auth) return c.json({ error: 'Unauthorized' }, 401);
-  // ... your logic
-});
-```
-
-Register in `src/index.ts`:
-
-```ts
-import { lakhouseRouter } from './routes/lakehouse';
-app.route('/v1/lakehouse', lakhouseRouter);
-```
-
-Auth helpers available:
-- `authenticateInternalRequest(req)` — dual-auth: X-Admin-Key or Bearer JWT
-- `getAuthFromRequest(req)` — Bearer JWT only
-- Both return an `AuthPayload` with `sub` (user ID), `email`, `instance_id`, etc.
-
----
-
-## Hetzner deployment
-
-### PM2
-
-Create `ecosystem.config.js` at the repo root:
-
-```js
-module.exports = {
-  apps: [{
-    name: 'api-apifunnel-ai',
-    script: 'dist/index.js',
-    instances: 1,
-    autorestart: true,
-    watch: false,
-    env_file: '.env',
-  }],
-};
-```
+### 1b. Start services
 
 ```bash
-npm ci
-npm run build
-pm2 start ecosystem.config.js
-pm2 save
-pm2 startup   # follow the printed command to enable auto-restart on reboot
+./scripts/dev.sh
 ```
 
-### Caddy
+This starts:
+- Orchestration → `http://localhost:3001`
+- Lakehouse → `http://localhost:3002`
 
-Add to your `Caddyfile`:
-
-```
-api.apifunnel.ai {
-    reverse_proxy /v1/* localhost:3001
-    reverse_proxy /health localhost:3001
-
-    # Proxy Graphiti under a clean path (optional — lets the web app reach it via HTTPS)
-    reverse_proxy /graphiti/* localhost:8001
-}
-```
-
-Caddy handles HTTPS + Let's Encrypt automatically.
-
-### Deploy flow
+### 1c. Verify health
 
 ```bash
-git pull origin main
-npm ci
-npm run build
-pm2 restart api-apifunnel-ai
+curl -sf http://localhost:3001/health && echo " ✅ Orchestration OK"
+curl -sf http://localhost:3002/health && echo " ✅ Lakehouse OK"
+```
+
+### 1d. Test lakehouse endpoints
+
+```bash
+# List assets (needs a JWT — craft a minimal one or use the admin key)
+curl -s http://localhost:3002/api/v1/assets \
+  -H "Authorization: Bearer $(cat .env | grep MCP_ADMIN_KEY | cut -d= -f2-)" \
+  | head -c 200
+
+# Internal search (admin key + user token pattern)
+ADMIN_KEY=$(grep MCP_ADMIN_KEY .env | cut -d= -f2-)
+curl -s http://localhost:3002/internal/assets/search?q=test \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "X-User-Token: eyJhbGciOiJub25lIn0.eyJzdWIiOiJ0ZXN0LXVzZXIiLCJ0ZW5hbnRfaWQiOiJ0ZXN0In0."
+```
+
+### 1e. Test orchestration endpoints
+
+```bash
+curl -s http://localhost:3001/v1/openapi | head -c 200
+```
+
+### Testing checklist
+
+- [ ] `GET /health` on both services returns OK
+- [ ] MongoDB connects on startup (check logs for "Connected to MongoDB")
+- [ ] Lakehouse: `POST /api/v1/assets/upload` with a file → creates asset
+- [ ] Lakehouse: `GET /api/v1/assets` → lists assets
+- [ ] Lakehouse: `GET /api/v1/assets/search?q=...` → text search works
+- [ ] Lakehouse: `GET /api/v1/assets/{id}` → single asset
+- [ ] Lakehouse: `GET /api/v1/assets/{id}/download` → raw bytes
+- [ ] Lakehouse: `DELETE /api/v1/assets/{id}` → removes from S3 + MongoDB
+- [ ] Lakehouse: Internal routes work with admin key + X-User-Token
+- [ ] Orchestration: `/v1/openapi` returns YAML
+- [ ] Auth: requests without auth → 401/403
+
+---
+
+## Phase 2: Set GitHub Secrets
+
+Use the `gh` CLI to set all secrets directly. Source the values from the local `.env` file. Run these commands from the repo root:
+
+```bash
+cd /path/to/api-apifunnel-ai
+
+# Helper: read a value from .env (handles quoting)
+env_val() { grep "^$1=" .env | head -1 | sed "s/^$1=//" | sed 's/^"//;s/"$//' ; }
+```
+
+All values come from two files — no placeholders, no manual lookups:
+- **This repo's `.env`** → most secrets
+- **Bridge `.env`** at `/Users/kenwiltshire/Documents/dev/mcp-code-execution/.env` → Hetzner infra secrets
+
+```bash
+REPO="wiltshirek/app-apifunnel-ai"
+BRIDGE_ENV="/Users/kenwiltshire/Documents/dev/mcp-code-execution/.env"
+
+# Helper: read a value from this repo's .env
+env_val() { grep "^$1=" .env | head -1 | sed "s/^$1=//" | sed 's/^"//;s/"$//' ; }
+
+# Helper: read a value from the bridge .env
+bridge_val() { grep "^$1=" "$BRIDGE_ENV" | head -1 | sed "s/^$1=//" | sed 's/^"//;s/"$//' ; }
+
+# ── From this repo's .env ─────────────────────────────────────────────────
+
+# Database
+gh secret set MONGODB_URI           --body "$(env_val MONGODB_URI)"           --repo "$REPO"
+gh secret set LAKEHOUSE_MONGODB_URI --body "$(env_val LAKEHOUSE_MONGODB_URI)" --repo "$REPO"
+
+# Auth
+gh secret set JWT_SECRET   --body "$(env_val JWT_SECRET)"   --repo "$REPO"
+gh secret set MCP_ADMIN_KEY --body "$(env_val MCP_ADMIN_KEY)" --repo "$REPO"
+gh secret set CRON_SECRET  --body "$(env_val CRON_SECRET)"  --repo "$REPO"
+
+# Firebase
+gh secret set FIREBASE_PROJECT_ID   --body "$(env_val FIREBASE_PROJECT_ID)"   --repo "$REPO"
+gh secret set FIREBASE_CLIENT_EMAIL --body "$(env_val FIREBASE_CLIENT_EMAIL)" --repo "$REPO"
+gh secret set FIREBASE_PRIVATE_KEY  --body "$(env_val FIREBASE_PRIVATE_KEY)"  --repo "$REPO"
+
+# External services
+gh secret set APP_BASE_URL         --body "$(env_val APP_BASE_URL)"         --repo "$REPO"
+gh secret set GRAPHITI_SERVICE_URL --body "$(env_val GRAPHITI_SERVICE_URL)" --repo "$REPO"
+
+# Hetzner S3
+gh secret set HETZNER_S3_ENDPOINT      --body "$(env_val HETZNER_S3_ENDPOINT)"      --repo "$REPO"
+gh secret set HETZNER_S3_ACCESS_KEY    --body "$(env_val HETZNER_S3_ACCESS_KEY)"    --repo "$REPO"
+gh secret set HETZNER_S3_SECRET        --body "$(env_val HETZNER_S3_SECRET)"        --repo "$REPO"
+gh secret set HETZNER_S3_REGION        --body "$(env_val HETZNER_S3_REGION)"        --repo "$REPO"
+gh secret set HETZNER_S3_ASSETS_BUCKET --body "$(env_val HETZNER_S3_ASSETS_BUCKET)" --repo "$REPO"
+
+# ── From the bridge .env ──────────────────────────────────────────────────
+
+# Hetzner Cloud API token (used by hcloud to find the server by label)
+# In the bridge .env this is called HETZNER_API_KEY — same value, different name
+gh secret set HETZNER_API_TOKEN --body "$(bridge_val HETZNER_API_KEY)" --repo "$REPO"
+
+# SSH deploy key (the bridge stores this as WEBHOOK_SSH_PRIVATE_KEY, multiline)
+# Extract it properly: everything between the quotes after WEBHOOK_SSH_PRIVATE_KEY=
+python3 -c "
+import re, pathlib
+env = pathlib.Path('$BRIDGE_ENV').read_text()
+m = re.search(r'WEBHOOK_SSH_PRIVATE_KEY=\"(-----BEGIN.*?-----END OPENSSH PRIVATE KEY-----)', env, re.DOTALL)
+if m: print(m.group(1))
+" | gh secret set DEPLOY_SSH_KEY --repo "$REPO"
+```
+
+### Verify secrets are set
+
+```bash
+gh secret list --repo wiltshirek/app-apifunnel-ai
+```
+
+You should see all of: `MONGODB_URI`, `LAKEHOUSE_MONGODB_URI`, `JWT_SECRET`, `MCP_ADMIN_KEY`, `CRON_SECRET`, `FIREBASE_PROJECT_ID`, `FIREBASE_CLIENT_EMAIL`, `FIREBASE_PRIVATE_KEY`, `APP_BASE_URL`, `GRAPHITI_SERVICE_URL`, `HETZNER_S3_ENDPOINT`, `HETZNER_S3_ACCESS_KEY`, `HETZNER_S3_SECRET`, `HETZNER_S3_REGION`, `HETZNER_S3_ASSETS_BUCKET`, `HETZNER_API_TOKEN`, `DEPLOY_SSH_KEY`.
+
+---
+
+## Phase 3: Hetzner Server Provisioning
+
+### 3a. Check if the server exists
+
+```bash
+export HCLOUD_TOKEN="<hetzner-api-token>"
+hcloud server list -l role=api-platform
+```
+
+If a server with label `role=api-platform` already exists and is running, skip to 3c.
+
+If no server exists, either:
+- Create one in Hetzner Cloud Console with label `role=api-platform`
+- Or use: `hcloud server create --name api-platform --type cx22 --image ubuntu-22.04 --location hel1 --label role=api-platform`
+
+### 3b. Label an existing server (if reusing one)
+
+```bash
+hcloud server add-label <server-name> role=api-platform
+```
+
+### 3c. Install prerequisites on the server
+
+SSH into the server and run:
+
+```bash
+NODE_IP=$(hcloud server list -l role=api-platform --status running -o noheader -o 'columns=ipv4' | head -1 | tr -d '[:space:]')
+ssh root@$NODE_IP
+```
+
+Then on the server:
+
+```bash
+# Node.js 20
+curl -fsSL https://deb.nodesource.com/setup_20.x | bash -
+apt-get install -y nodejs
+
+# Python 3.11+
+apt-get install -y python3 python3-pip python3-venv libmagic1
+
+# PM2
+npm install -g pm2
+pm2 startup
+
+# Caddy
+apt-get install -y debian-keyring debian-archive-keyring apt-transport-https
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/gpg.key' | gpg --dearmor -o /usr/share/keyrings/caddy-stable-archive-keyring.gpg
+curl -1sLf 'https://dl.cloudsmith.io/public/caddy/stable/debian.deb.txt' | tee /etc/apt/sources.list.d/caddy-stable.list
+apt-get update
+apt-get install caddy
+
+# App directory
+mkdir -p /opt/api-apifunnel/services
+```
+
+Verify:
+```bash
+node --version    # v20.x
+python3 --version # 3.11+
+pm2 --version
+caddy version
+```
+
+### 3d. DNS
+
+Ensure `api.apifunnel.ai` has an A record pointing to `$NODE_IP`. Caddy handles TLS automatically via Let's Encrypt.
+
+---
+
+## Phase 4: Deploy
+
+### Option A: Push to main (automatic)
+
+```bash
+git add -A && git commit -m "Initial monorepo setup" && git push origin main
+```
+
+The GitHub Actions workflow triggers automatically.
+
+### Option B: Manual dispatch
+
+Go to Actions tab → "Deploy to Hetzner" → "Run workflow" → select `main`.
+
+### Option C: Via gh CLI
+
+```bash
+gh workflow run deploy.yml --repo wiltshirek/app-apifunnel-ai
+```
+
+### Monitor the deploy
+
+```bash
+gh run list --repo wiltshirek/app-apifunnel-ai --limit 3
+gh run watch --repo wiltshirek/app-apifunnel-ai   # live tail
 ```
 
 ---
 
-## Complete `.env` reference
+## Phase 5: Post-Deploy
 
-All values are already in the `.env` file. This table is for reference only.
+### 5a. Create MongoDB text index
 
-| Variable | Value source | Notes |
-|---|---|---|
-| `MONGODB_URI` | `web/.env.local` | Same cluster, same `apifunnel` database |
-| `JWT_SECRET` | `web/.env.local` | Web app uses unsigned JWTs — keep as `unsigned-trust-relationship` |
-| `MCP_ADMIN_KEY` | `web/.env.local` | Must match bridge exactly |
-| `CRON_SECRET` | **You set this** | Any strong random string, same value in Vercel |
-| `FIREBASE_PROJECT_ID` | `web/.env.local` | `apifunnel-ai` |
-| `FIREBASE_CLIENT_EMAIL` | `web/.env.local` | Same service account |
-| `FIREBASE_PRIVATE_KEY` | `web/.env.local` | Same service account key |
-| `APP_BASE_URL` | — | `https://app.apifunnel.ai` — subagent runner calls `/api/chat` here |
-| `GRAPHITI_SERVICE_URL` | — | `http://localhost:8001` once Graphiti is running on the box |
-| `PORT` | — | `3001` |
-| `NODE_ENV` | — | `production` |
+This is a one-time operation after first deploy. The lakehouse search endpoint requires it.
 
----
+Connect to MongoDB Atlas (use `mongosh` or the Atlas UI Data Explorer) and run:
 
-## Vercel environment variables to add on `one-mcp/web`
+```javascript
+use mcp_code_execution_server
+db.assets.createIndex({ extracted_text: "text" })
+```
 
-Once this server is live, add these to the Vercel project settings for `one-mcp/web`:
-
-| Variable | Value |
-|---|---|
-| `ORCHESTRATION_API_URL` | `https://api.apifunnel.ai` |
-| `GRAPHITI_SERVICE_URL` | `https://api.apifunnel.ai/graphiti` |
-| `CRON_SECRET` | Same value as in this server's `.env` |
-
----
-
-## Quick health check after deploy
+### 5b. Verify production health
 
 ```bash
-curl https://api.apifunnel.ai/health
-# → {"status":"ok","ts":"..."}
+curl -sf https://api.apifunnel.ai/health && echo " ✅ Orchestration OK"
+curl -sf https://api.apifunnel.ai/health/lakehouse && echo " ✅ Lakehouse OK"
+```
 
-curl https://api.apifunnel.ai/v1/openapi.json
-# → full OpenAPI YAML spec
+### 5c. Verify routing
+
+```bash
+# Lakehouse routes
+curl -s https://api.apifunnel.ai/api/v1/assets -H "Authorization: Bearer test" | head -c 200
+
+# Orchestration routes
+curl -s https://api.apifunnel.ai/v1/openapi | head -c 200
+```
+
+---
+
+## Repository Structure
+
+```
+api-apifunnel-ai/
+├── .env                      # Real credentials (gitignored)
+├── .env.example              # Template (safe to commit)
+├── .github/workflows/
+│   └── deploy.yml            # GitHub Actions → Hetzner
+├── docker-compose.yml        # Local dev with Docker
+├── proxy/
+│   ├── Caddyfile             # Production Caddy config
+│   └── Caddyfile.dev         # Local dev Caddy config (port 3000)
+├── scripts/
+│   ├── dev.sh                # Start both services locally
+│   └── prod.sh               # PM2 build + start for production
+├── services/
+│   ├── orchestration/        # Node.js (Hono + Mongoose)
+│   │   ├── package.json
+│   │   ├── tsconfig.json
+│   │   ├── Dockerfile
+│   │   ├── openapi/
+│   │   └── src/
+│   └── lakehouse/            # Python (FastAPI + Motor)
+│       ├── pyproject.toml
+│       ├── Dockerfile
+│       └── src/
+│           ├── main.py       # FastAPI app, CORS, lifespan
+│           ├── db.py         # Motor MongoDB connection
+│           ├── auth.py       # JWT decode, admin key, dual-auth
+│           ├── routes/
+│           │   ├── internal.py   # /internal/assets/* (MCP_ADMIN_KEY)
+│           │   └── external.py   # /api/v1/assets/* (Bearer JWT)
+│           ├── services/
+│           │   └── assets.py     # Upload, search, thumbnails, PDF extraction
+│           └── storage/
+│               └── s3.py         # Hetzner S3 client
+└── HANDOFF.md                # This file
+```
+
+---
+
+## Environment Variables Reference
+
+| Variable                | Used by        | Purpose                              |
+|-------------------------|----------------|--------------------------------------|
+| `NODE_ENV`              | Both           | `development` or `production`        |
+| `MONGODB_URI`           | Orchestration  | → `apifunnel` database               |
+| `LAKEHOUSE_MONGODB_URI` | Lakehouse      | → `mcp_code_execution_server` DB     |
+| `LAKEHOUSE_DB_NAME`     | Lakehouse      | Explicit DB name (fallback default)  |
+| `MCP_ADMIN_KEY`         | Both           | Server-to-server auth                |
+| `JWT_SECRET`            | Both           | JWT decode (unsigned trust)          |
+| `HETZNER_S3_*`          | Lakehouse      | S3 storage for asset binaries        |
+| `FIREBASE_*`            | Orchestration  | Firestore notifications              |
+| `PORT`                  | Orchestration  | HTTP port (default 3001)             |
+| `APP_BASE_URL`          | Orchestration  | Frontend app URL                     |
+| `GRAPHITI_SERVICE_URL`  | Orchestration  | Learning graph service               |
+| `CRON_SECRET`           | Orchestration  | Vercel cron auth                     |
+
+---
+
+## Bridge Integration
+
+The MCP bridge (`mcp-code-execution` project) has been updated:
+
+**File:** `.mcp-bridge/mcp-servers.json` → `lakehouse_api` entry
+- `base_url`: `http://localhost:3002` (was `http://localhost:8080`)
+- `prod_url`: `https://api.apifunnel.ai` (was `https://tool.apifunnel.ai`)
+
+Auth pattern (`"pattern": "lakehouse"`) means the bridge sends:
+- `Authorization: Bearer <MCP_ADMIN_KEY>` for server-to-server calls
+- `X-User-Token: <user_jwt>` to forward user identity
+
+---
+
+## Troubleshooting
+
+### Lakehouse can't connect to MongoDB
+- Check `LAKEHOUSE_MONGODB_URI` is set (falls back to `MONGODB_URI` if not)
+- Verify MongoDB Atlas IP access list includes the Hetzner node's IP
+- `pm2 logs lakehouse`
+
+### S3 uploads failing
+- Verify all `HETZNER_S3_*` env vars are set
+- Verify `mcp-lakehouse` bucket exists in Hetzner Object Storage
+- Lakehouse gracefully degrades if S3 is unavailable (logs warning)
+
+### Caddy not routing
+- `caddy validate --config /etc/caddy/Caddyfile`
+- `caddy reload --config /etc/caddy/Caddyfile`
+- `journalctl -u caddy -f`
+
+### PM2 commands
+```bash
+pm2 ls                    # List all services
+pm2 logs orchestration    # Orchestration logs
+pm2 logs lakehouse        # Lakehouse logs
+pm2 restart all           # Restart everything
+pm2 monit                 # Real-time monitoring
 ```
