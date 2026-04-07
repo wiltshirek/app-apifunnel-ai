@@ -56,8 +56,55 @@ paths:
                     type: array
                     items:
                       type: object
+                      properties:
+                        asset_id:
+                          type: string
+                          description: Unique asset identifier. Use to call /view, /text, /bytes, /download, /promote, DELETE.
+                          example: "ast_qqToI6wd1Bim"
+                        filename:
+                          type: string
+                          example: "report.pdf"
+                        content_type:
+                          type: string
+                          description: |
+                            MIME type. Use to decide which follow-up call to make:
+                            application/pdf or application/dxf → /view for rendered pages.
+                            text/* or application/json → /text for extracted content.
+                            anything else → /bytes for raw bytes.
+                          example: "application/pdf"
+                        size_bytes:
+                          type: integer
+                          example: 204800
+                        tenant_id:
+                          type: string
+                          nullable: true
+                        page_count:
+                          type: integer
+                          nullable: true
+                          description: Present for PDFs only.
+                        thumbnail_url:
+                          type: string
+                          nullable: true
+                          description: Pre-signed S3 URL for thumbnail preview (expires in 1 hour).
+                        subagent_task_id:
+                          type: string
+                          nullable: true
+                          description: Set when the asset was uploaded by a subagent run.
+                        scheduled_task_id:
+                          type: string
+                          nullable: true
+                          description: Set when the asset was uploaded by a scheduled task execution.
+                        session_id:
+                          type: string
+                          nullable: true
+                          description: Present if the asset is an ephemeral session artifact (not yet promoted).
+                        created_at:
+                          type: string
+                          format: date-time
                   next_cursor:
                     type: string
+                    nullable: true
+                    description: Pass as cursor param to get the next page.
                   has_more:
                     type: boolean
         '401':
@@ -108,16 +155,38 @@ paths:
                   properties:
                     asset_id:
                       type: string
+                      description: Use to call /view, /text, /bytes, /download.
+                      example: "ast_qqToI6wd1Bim"
                     filename:
                       type: string
+                      example: "contract_draft.pdf"
                     content_type:
                       type: string
+                      description: |
+                        Use to decide which follow-up call to make:
+                        application/pdf or application/dxf → /view.
+                        text/* or application/json → /text.
+                        anything else → /bytes.
+                      example: "application/pdf"
+                    size_bytes:
+                      type: integer
                     page_count:
                       type: integer
+                      nullable: true
+                      description: Present for PDFs.
+                    tenant_id:
+                      type: string
+                      nullable: true
                     snippet:
                       type: string
+                      nullable: true
+                      description: Up to 200 chars of matching extracted text.
                     score:
                       type: number
+                      description: Full-text relevance score (higher is better).
+                    created_at:
+                      type: string
+                      format: date-time
         '401':
           description: Unauthorized
 
@@ -163,15 +232,52 @@ paths:
                 properties:
                   asset_id:
                     type: string
+                    description: Unique identifier. Use to call /view, /text, /bytes, /download, /promote, DELETE.
+                    example: "ast_qqToI6wd1Bim"
                   filename:
                     type: string
+                    example: "report.pdf"
                   content_type:
                     type: string
+                    example: "application/pdf"
                   size_bytes:
                     type: integer
+                    example: 204800
+                  checksum_sha256:
+                    type: string
+                    description: SHA-256 hex digest of the file content.
+                  s3_key:
+                    type: string
+                    description: Internal S3 object key.
+                  thumbnail_url:
+                    type: string
+                    nullable: true
+                    description: Pre-signed S3 URL for thumbnail (expires 1 hour). Present for PDFs and images.
+                  snippet:
+                    type: string
+                    nullable: true
+                    description: First ~200 chars of extracted text. Present for PDFs.
+                  tenant_id:
+                    type: string
+                    nullable: true
+                  page_count:
+                    type: integer
+                    nullable: true
+                    description: Present for PDFs.
+                  subagent_task_id:
+                    type: string
+                    nullable: true
+                    description: Populated from the caller's JWT if present.
+                  scheduled_task_id:
+                    type: string
+                    nullable: true
+                    description: Populated from the caller's JWT if present.
                   status:
                     type: string
-                    example: "complete"
+                    enum: [complete]
+                  created_at:
+                    type: string
+                    format: date-time
         '400':
           description: Missing required fields or invalid base64
         '401':
@@ -207,19 +313,76 @@ paths:
                 properties:
                   asset_id:
                     type: string
+                    example: "ast_qqToI6wd1Bim"
                   filename:
                     type: string
+                    example: "report.pdf"
                   content_type:
                     type: string
+                    description: |
+                      MIME type. Use to decide which follow-up call to make:
+                      application/pdf or application/dxf → /view.
+                      text/* or application/json → /text.
+                      anything else → /bytes.
+                    example: "application/pdf"
                   size_bytes:
                     type: integer
-                  page_count:
-                    type: integer
+                    example: 204800
+                  checksum_sha256:
+                    type: string
+                  s3_key:
+                    type: string
+                  tenant_id:
+                    type: string
+                    nullable: true
                   thumbnail_url:
                     type: string
+                    nullable: true
+                    description: Pre-signed S3 URL (expires 1 hour). Present for PDFs and images.
+                  document:
+                    type: object
+                    nullable: true
+                    description: Present for PDFs.
+                    properties:
+                      page_count:
+                        type: integer
+                      pages:
+                        type: array
+                        items:
+                          type: object
+                          properties:
+                            num:
+                              type: integer
+                            char_count:
+                              type: integer
+                  subagent_task_id:
+                    type: string
+                    nullable: true
+                  scheduled_task_id:
+                    type: string
+                    nullable: true
+                  session_id:
+                    type: string
+                    nullable: true
+                    description: Present if asset is an ephemeral session artifact.
+                  extracted_text:
+                    type: string
+                    nullable: true
+                    description: Only present when include_page_text=true.
+                  page_texts:
+                    type: object
+                    nullable: true
+                    description: Page-keyed text map. Only present when include_page_text=true.
+                  processing_status:
+                    type: string
+                    enum: [complete, processing, failed]
                   created_at:
                     type: string
                     format: date-time
+                  updated_at:
+                    type: string
+                    format: date-time
+                    nullable: true
         '404':
           description: Asset not found
     delete:
