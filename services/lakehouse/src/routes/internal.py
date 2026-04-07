@@ -115,7 +115,84 @@ async def internal_view(asset_id: str, request: Request):
 
     fmt = request.query_params.get("format", "auto")
     ct = asset.get("content_type", "")
+    filename = asset.get("filename", "")
     max_pages = int(request.query_params.get("max_pages", "5"))
+
+    # DXF/DWG rendering
+    is_dxf = ct in ("application/dxf", "application/acad", "image/vnd.dxf") or \
+             filename.lower().endswith(".dxf")
+    is_dwg = ct in ("application/dwg", "application/acad") or \
+             filename.lower().endswith(".dwg")
+
+    if (is_dxf or is_dwg) and fmt in ("pages", "auto"):
+        dxf_bytes = file_bytes
+
+        # DWG → DXF conversion via libredwg (optional, graceful skip if absent)
+        if is_dwg and not is_dxf:
+            import shutil, subprocess, tempfile, os
+            if shutil.which("dwg2dxf"):
+                try:
+                    with tempfile.TemporaryDirectory() as tmp:
+                        dwg_path = os.path.join(tmp, "input.dwg")
+                        dxf_path = os.path.join(tmp, "input.dxf")
+                        with open(dwg_path, "wb") as f:
+                            f.write(file_bytes)
+                        subprocess.run(["dwg2dxf", dwg_path, "-o", dxf_path],
+                                       check=True, capture_output=True, timeout=30)
+                        with open(dxf_path, "rb") as f:
+                            dxf_bytes = f.read()
+                        is_dxf = True
+                except Exception as exc:
+                    logger.warning("DWG→DXF conversion failed: %s", exc)
+            else:
+                logger.warning("dwg2dxf not found — cannot render DWG; returning raw bytes")
+
+        if is_dxf:
+            try:
+                import io as _io
+                import ezdxf
+                from ezdxf.addons.drawing import RenderContext, Frontend
+                from ezdxf.addons.drawing.matplotlib import MatplotlibBackend
+                import matplotlib
+                matplotlib.use("Agg")
+                import matplotlib.pyplot as plt
+
+                dxf_text = dxf_bytes.decode("utf-8", errors="replace")
+                doc = ezdxf.read(_io.StringIO(dxf_text))
+                msp = doc.modelspace()
+
+                fig = plt.figure(figsize=(12, 12), dpi=150)
+                ax = fig.add_axes([0, 0, 1, 1])
+                ax.set_aspect("equal")
+                ctx = RenderContext(doc)
+                backend = MatplotlibBackend(ax)
+                Frontend(ctx, backend).draw_layout(msp, finalize=True)
+
+                buf = _io.BytesIO()
+                fig.savefig(buf, format="png", bbox_inches="tight",
+                            facecolor=fig.get_facecolor())
+                plt.close(fig)
+                buf.seek(0)
+                png_bytes = buf.read()
+
+                w_in, h_in = fig.get_size_inches()
+                dpi = fig.get_dpi()
+                return JSONResponse({
+                    "asset_id": asset_id,
+                    "filename": filename,
+                    "content_type": ct,
+                    "format": "pages",
+                    "total_pages": 1,
+                    "pages": [{
+                        "page_num": 1,
+                        "base64": base64.b64encode(png_bytes).decode(),
+                        "width": int(w_in * dpi),
+                        "height": int(h_in * dpi),
+                    }],
+                })
+            except Exception as exc:
+                logger.error("DXF rendering failed: %s", exc)
+                return JSONResponse({"error": f"DXF rendering failed: {exc}"}, status_code=500)
 
     if ct == "application/pdf" and fmt in ("pages", "auto"):
         try:

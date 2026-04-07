@@ -128,7 +128,7 @@ jobs:
           $SCP services/orchestration/openapi "root@$NODE_IP:/opt/api-apifunnel/services/orchestration/"
 
           $SSH "cd /opt/api-apifunnel/services/orchestration && npm ci --production=false && npm run build"
-          $SSH "set -a && source /opt/api-apifunnel/.env && set +a && cd /opt/api-apifunnel && (pm2 restart orchestration --update-env 2>/dev/null || pm2 start services/orchestration/dist/index.js --name orchestration --max-memory-restart 512M)"
+          $SSH "cd /opt/api-apifunnel && pm2 restart orchestration --update-env 2>/dev/null || pm2 start services/orchestration/dist/index.js --name orchestration --env-file .env --max-memory-restart 512M"
           echo "✅ Orchestration deployed"
 
       - name: Deploy lakehouse
@@ -141,6 +141,7 @@ jobs:
           $SSH "mkdir -p /opt/api-apifunnel/services/lakehouse"
           $SCP services/lakehouse/pyproject.toml "root@$NODE_IP:/opt/api-apifunnel/services/lakehouse/"
           $SCP services/lakehouse/src "root@$NODE_IP:/opt/api-apifunnel/services/lakehouse/"
+          $SCP services/lakehouse/openapi "root@$NODE_IP:/opt/api-apifunnel/services/lakehouse/"
 
           $SSH "cd /opt/api-apifunnel/services/lakehouse && pip install --no-cache-dir -q ."
           $SSH "cd /opt/api-apifunnel && pm2 restart lakehouse --update-env 2>/dev/null || pm2 start 'uvicorn src.main:app --host 0.0.0.0 --port 3002 --workers 2' --name lakehouse --cwd services/lakehouse --interpreter none --max-memory-restart 512M"

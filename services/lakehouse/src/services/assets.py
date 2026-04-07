@@ -355,6 +355,32 @@ async def search_assets(
     ]
 
 
+async def promote_session_artifact(
+    db,
+    asset_id: str,
+    user_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+    admin_access: bool = False,
+) -> bool:
+    """Remove ephemeral session metadata from an asset, making it permanent."""
+    query: Dict[str, Any] = {"_id": asset_id}
+    if not admin_access:
+        if not user_id:
+            return False
+        query["user_id"] = user_id
+    if tenant_id:
+        query["tenant_id"] = tenant_id
+
+    result = await db.assets.update_one(
+        query,
+        {
+            "$unset": {"session_id": "", "is_ephemeral": ""},
+            "$set": {"updated_at": datetime.utcnow()},
+        },
+    )
+    return result.matched_count > 0
+
+
 async def delete_asset(db, asset_id: str, user_id: str, admin_access: bool = False) -> bool:
     from ..storage.s3 import delete_file
 

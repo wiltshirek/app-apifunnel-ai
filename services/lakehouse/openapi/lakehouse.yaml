@@ -1,0 +1,422 @@
+openapi: 3.0.0
+info:
+  title: Lakehouse API
+  description: |
+    Asset storage and retrieval API for document management.
+    Search PDFs by content, view files for vision analysis, process with PyMuPDF.
+    
+    This is an internal API that agents can discover and use like any external REST API.
+  version: 1.0.0
+
+servers:
+  - url: http://localhost:3002
+    description: Local development
+  - url: https://api.apifunnel.ai
+    description: Production
+
+paths:
+  /internal/assets/search:
+    post:
+      operationId: search_assets
+      summary: Search assets by text content
+      description: |
+        Full-text search across user's documents.
+        Returns matching assets with relevance scores and text snippets.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - query
+              properties:
+                query:
+                  type: string
+                  description: Search terms (full-text search)
+                  example: "liability clause"
+                content_type:
+                  type: string
+                  description: Filter by MIME type
+                  example: "application/pdf"
+                tenant_id:
+                  type: string
+                  description: Filter by tenant
+                limit:
+                  type: integer
+                  description: Max results
+                  default: 20
+                  minimum: 1
+                  maximum: 100
+      responses:
+        '200':
+          description: Search results
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  type: object
+                  properties:
+                    asset_id:
+                      type: string
+                    filename:
+                      type: string
+                    content_type:
+                      type: string
+                    page_count:
+                      type: integer
+                    snippet:
+                      type: string
+                    score:
+                      type: number
+        '401':
+          description: Unauthorized
+
+  /internal/assets/{asset_id}:
+    get:
+      operationId: get_asset_metadata
+      summary: Get asset metadata
+      description: Get full metadata for an asset including page info for PDFs
+      parameters:
+        - name: asset_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Asset ID
+        - name: include_page_text
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Include extracted text per page (can be large)
+      responses:
+        '200':
+          description: Asset metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asset_id:
+                    type: string
+                  filename:
+                    type: string
+                  content_type:
+                    type: string
+                  size_bytes:
+                    type: integer
+                  page_count:
+                    type: integer
+                  created_at:
+                    type: string
+                    format: date-time
+        '404':
+          description: Asset not found
+
+  /internal/assets/{asset_id}/view:
+    get:
+      operationId: get_asset_view
+      summary: Get asset content for vision models
+      description: |
+        Returns base64-encoded content for vision analysis.
+        For PDFs, returns individual pages as PNG images.
+        For DXF/DWG, renders the drawing to a PNG image and returns it as a single page.
+        For other formats, returns raw base64 bytes.
+      parameters:
+        - name: asset_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [pdf, pages, auto]
+            default: auto
+          description: Output format
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+          description: Specific page number for 'pages' format
+        - name: max_pages
+          in: query
+          schema:
+            type: integer
+            default: 5
+          description: Max pages for 'auto' format
+      responses:
+        '200':
+          description: Asset content (base64)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asset_id:
+                    type: string
+                  filename:
+                    type: string
+                  content_type:
+                    type: string
+                  format:
+                    type: string
+                  base64:
+                    type: string
+                  page_count:
+                    type: integer
+                  total_pages:
+                    type: integer
+                    description: Total page/frame count (DXF always 1)
+                  page_count:
+                    type: integer
+                    description: Alias for total_pages (PDFs)
+                  pages:
+                    type: array
+                    description: Rendered pages/frames
+                    items:
+                      type: object
+                      properties:
+                        page_num:
+                          type: integer
+                          description: 1-based page number (DXF and PDFs)
+                        page:
+                          type: integer
+                          description: Alias for page_num (PDFs)
+                        base64:
+                          type: string
+                        width:
+                          type: integer
+                        height:
+                          type: integer
+
+  /internal/assets/{asset_id}/bytes:
+    get:
+      operationId: get_asset_bytes
+      summary: Get raw asset bytes
+      description: Get base64-encoded raw bytes for PyMuPDF/Pillow processing
+      parameters:
+        - name: asset_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Raw bytes (base64)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asset_id:
+                    type: string
+                  content_type:
+                    type: string
+                  size_bytes:
+                    type: integer
+                  base64:
+                    type: string
+
+  /internal/assets:
+    post:
+      operationId: upload_asset
+      summary: Upload a new asset
+      description: |
+        Upload a file to the lakehouse as a base64-encoded payload.
+        The file is stored, indexed for search, and returned with a unique asset_id.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - filename
+                - base64_content
+              properties:
+                filename:
+                  type: string
+                  description: Original filename (e.g., "report.pdf")
+                  example: "weekly_report.pdf"
+                base64_content:
+                  type: string
+                  description: File content encoded as base64 string
+      responses:
+        '200':
+          description: Upload successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asset_id:
+                    type: string
+                  filename:
+                    type: string
+                  content_type:
+                    type: string
+                  size_bytes:
+                    type: integer
+                  status:
+                    type: string
+                    example: "complete"
+        '400':
+          description: Missing required fields or invalid base64
+        '401':
+          description: Unauthorized
+    get:
+      operationId: list_assets
+      summary: List user's assets
+      description: List assets with optional filtering by type or tenant
+      parameters:
+        - name: content_type
+          in: query
+          schema:
+            type: string
+          description: Filter by MIME type
+        - name: tenant_id
+          in: query
+          schema:
+            type: string
+          description: Filter by tenant
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 200
+          description: Max results
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Pagination cursor
+      responses:
+        '200':
+          description: Asset list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  assets:
+                    type: array
+                  next_cursor:
+                    type: string
+                  has_more:
+                    type: boolean
+
+  /api/v1/assets/{asset_id}/promote:
+    post:
+      operationId: promote_asset
+      summary: Promote ephemeral session artifact to permanent storage
+      description: |
+        Removes session metadata (session_id, is_ephemeral) from an asset document,
+        making it permanently visible in the user's asset library.
+        Called by the client UI "Save Permanently" action.
+      parameters:
+        - name: asset_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Promoted successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  asset_id:
+                    type: string
+                  message:
+                    type: string
+        '401':
+          description: Unauthorized
+        '404':
+          description: Asset not found or already permanent
+
+  /internal/assets/{asset_id}/text:
+    get:
+      operationId: get_asset_text
+      summary: Get full text content from an asset
+      description: |
+        Format-agnostic text extraction. Returns a JSON object — access the content via result['text'].
+        PDFs: text field contains all extracted text concatenated across all pages.
+        Text files (CSV, JSON, Markdown, plain text, HTML, XML, YAML, etc.): text field contains raw content.
+        Binary/visual files (images, DXF/DWG): returns an error directing to get_asset_view.
+        No truncation — the full text is always returned.
+      parameters:
+        - name: asset_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Asset ID
+      responses:
+        '200':
+          description: Full text content of the asset
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asset_id:
+                    type: string
+                  filename:
+                    type: string
+                  content_type:
+                    type: string
+                  text:
+                    type: string
+                    description: Full text content of the asset
+                  char_count:
+                    type: integer
+                    description: Character count of the returned text
+        '400':
+          description: Text extraction not supported for this content type
+        '404':
+          description: Asset not found
+
+  /health:
+    get:
+      operationId: health_check
+      summary: Health check
+      security: []
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+                  service:
+                    type: string
+                    example: lakehouse
+
+components:
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT token for external routes
+    AdminKey:
+      type: http
+      scheme: bearer
+      description: MCP_ADMIN_KEY for internal routes (with X-User-Token header for identity)
+
+security:
+  - BearerAuth: []

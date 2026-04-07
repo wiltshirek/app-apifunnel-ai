@@ -18,6 +18,7 @@ from ..services.assets import (
     detect_content_type,
     get_asset,
     list_assets,
+    promote_session_artifact,
     search_assets,
     upload_asset,
 )
@@ -28,8 +29,21 @@ router = APIRouter(prefix="/api/v1/assets")
 
 
 def _resolve_auth(request: Request) -> tuple[Optional[Identity], bool]:
-    """Return (identity, is_admin). Admin callers get identity=None."""
+    """Return (identity, is_admin).
+
+    Admin key + X-User-Token → scoped identity with is_admin=True (bridge/MCP calls).
+    Admin key alone → identity=None, is_admin=True (unscoped admin tooling).
+    Bearer JWT → user identity, is_admin=False.
+    """
     if verify_admin_key(request):
+        user_token = request.headers.get("x-user-token") or ""
+        if user_token:
+            claims = _decode_jwt_payload(user_token)
+            if claims:
+                ident = _identity_from_claims(claims)
+                if ident:
+                    ident.is_admin = True
+                    return ident, True
         return None, True
     ident = authenticate_jwt(request)
     return ident, False
@@ -101,7 +115,12 @@ async def api_upload(
     uploaded = []
     for f in files:
         file_bytes = await f.read()
-        result = await upload_asset(db, file_bytes, f.filename or "untitled", effective_user, tenant_id=effective_tenant)
+        result = await upload_asset(
+            db, file_bytes, f.filename or "untitled", effective_user,
+            tenant_id=effective_tenant,
+            subagent_task_id=ident.subagent_task_id if ident else None,
+            scheduled_task_id=ident.scheduled_task_id if ident else None,
+        )
         uploaded.append(result)
 
     return JSONResponse({"assets": uploaded})
@@ -204,6 +223,25 @@ async def api_download(asset_id: str, request: Request):
         media_type=ct,
         headers={"Content-Disposition": f'attachment; filename="{filename}"'},
     )
+
+
+@router.post("/{asset_id}/promote")
+async def api_promote(asset_id: str, request: Request):
+    ident, is_admin = _resolve_auth(request)
+    if not ident and not is_admin:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    db = await get_db()
+    promoted = await promote_session_artifact(
+        db, asset_id,
+        user_id=ident.user_id if ident else None,
+        tenant_id=ident.tenant_id if ident else None,
+        admin_access=is_admin,
+    )
+    if not promoted:
+        return JSONResponse({"error": "Asset not found or already promoted"}, status_code=404)
+    return JSONResponse({"success": True, "asset_id": asset_id,
+                         "message": "Asset promoted to permanent storage"})
 
 
 @router.delete("/{asset_id}")

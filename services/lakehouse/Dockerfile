@@ -10,6 +10,7 @@ COPY pyproject.toml ./
 RUN pip install --no-cache-dir .
 
 COPY src/ src/
+COPY openapi/ openapi/
 
 ENV PYTHONUNBUFFERED=1
 EXPOSE 3002
