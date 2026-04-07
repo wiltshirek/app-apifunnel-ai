@@ -17,7 +17,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import PlainTextResponse
 
 from .db import get_db, close_db
-from .routes.internal import router as internal_router
 from .routes.external import router as external_router
 
 _OPENAPI_SPEC = Path(__file__).resolve().parent.parent / "openapi" / "lakehouse.yaml"
@@ -55,7 +54,6 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(internal_router)
 app.include_router(external_router)
 
 
