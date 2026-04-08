@@ -26,11 +26,9 @@ app.use('*', cors({
 app.get('/health', (c) => c.json({ status: 'ok', ts: new Date().toISOString() }));
 
 // ── OpenAPI spec ────────────────────────────────────────────────────────────
-app.get('/v1/openapi.json', (c) => {
+app.get('/v1/openapi.yaml', (c) => {
   try {
     const specPath = join(__dirname, '..', 'openapi', 'orchestration.yaml');
-    // Return the raw YAML for clients that can parse it; most tools prefer JSON
-    // but serving YAML keeps the spec as the source of truth.
     c.header('Content-Type', 'application/yaml');
     return c.body(readFileSync(specPath, 'utf8'));
   } catch {
@@ -59,7 +57,7 @@ async function main() {
 
   serve({ fetch: app.fetch, port: PORT }, (info) => {
     console.log(`🚀 api-apifunnel-ai listening on http://localhost:${info.port}`);
-    console.log(`   OpenAPI spec: http://localhost:${info.port}/v1/openapi.json`);
+    console.log(`   OpenAPI spec: http://localhost:${info.port}/v1/openapi.yaml`);
     console.log(`   Health:       http://localhost:${info.port}/health`);
   });
 }
