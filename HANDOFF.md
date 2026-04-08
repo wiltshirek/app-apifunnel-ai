@@ -204,19 +204,22 @@ You should see all of: `MONGODB_URI`, `LAKEHOUSE_MONGODB_URI`, `JWT_SECRET`, `MC
 
 ```bash
 export HCLOUD_TOKEN="<hetzner-api-token>"
-hcloud server list -l role=api-platform
+hcloud server list -l app=api-platform
 ```
 
-If a server with label `role=api-platform` already exists and is running, skip to 3c.
+If a server with label `app=api-platform` already exists and is running, skip to 3c.
 
 If no server exists, either:
-- Create one in Hetzner Cloud Console with label `role=api-platform`
-- Or use: `hcloud server create --name api-platform --type cx22 --image ubuntu-22.04 --location hel1 --label role=api-platform`
+- Create one in Hetzner Cloud Console with label `app=api-platform`
+- Or use: `hcloud server create --name api-platform --type cx22 --image ubuntu-22.04 --location hel1 --label app=api-platform`
 
 ### 3b. Label an existing server (if reusing one)
 
+**IMPORTANT:** Use the `app` label key (not `role`). Other projects use the `role` key
+for their own selectors — overwriting it will break their deployments.
+
 ```bash
-hcloud server add-label <server-name> role=api-platform
+hcloud server add-label <server-name> app=api-platform
 ```
 
 ### 3c. Install prerequisites on the server
@@ -224,7 +227,7 @@ hcloud server add-label <server-name> role=api-platform
 SSH into the server and run:
 
 ```bash
-NODE_IP=$(hcloud server list -l role=api-platform --status running -o noheader -o 'columns=ipv4' | head -1 | tr -d '[:space:]')
+NODE_IP=$(hcloud server list -l app=api-platform --status running -o noheader -o 'columns=ipv4' | head -1 | tr -d '[:space:]')
 ssh root@$NODE_IP
 ```
 

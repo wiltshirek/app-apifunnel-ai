@@ -65,9 +65,9 @@ jobs:
         env:
           HCLOUD_TOKEN: ${{ secrets.HETZNER_API_TOKEN }}
         run: |
-          NODE_IP=$(hcloud server list -l role=api-platform --status running -o noheader -o 'columns=ipv4' | head -1 | tr -d '[:space:]')
+          NODE_IP=$(hcloud server list -l app=api-platform --status running -o noheader -o 'columns=ipv4' | head -1 | tr -d '[:space:]')
           if [ -z "$NODE_IP" ]; then
-            echo "❌ No running node with label role=api-platform"
+            echo "❌ No running node with label app=api-platform"
             exit 1
           fi
           echo "NODE_IP=$NODE_IP" >> $GITHUB_ENV
