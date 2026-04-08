@@ -150,6 +150,7 @@ jobs:
           $SCP services/lakehouse/src "root@$NODE_IP:/opt/api-apifunnel/services/lakehouse/"
           $SCP services/lakehouse/openapi "root@$NODE_IP:/opt/api-apifunnel/services/lakehouse/"
 
+          $SSH "pip install --no-cache-dir -q 'pyOpenSSL>=23.2.0'"
           $SSH "cd /opt/api-apifunnel/services/lakehouse && pip install --no-cache-dir -q ."
           $SSH "cd /opt/api-apifunnel && pm2 restart lakehouse --update-env 2>/dev/null || pm2 start 'uvicorn src.main:app --host 0.0.0.0 --port 3002 --workers 2' --name lakehouse --cwd services/lakehouse --interpreter none --max-memory-restart 512M"
           echo "✅ Lakehouse deployed"
