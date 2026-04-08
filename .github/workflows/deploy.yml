@@ -117,12 +117,7 @@ jobs:
           HETZNER_S3_REGION=${{ secrets.HETZNER_S3_REGION }}
           HETZNER_S3_ASSETS_BUCKET=${{ secrets.HETZNER_S3_ASSETS_BUCKET }}
 
-          PRBOT_MONGODB_URI=${{ secrets.PRBOT_MONGODB_URI }}
-          PRBOT_DB_NAME=mcp_code_execution_server
           ENCRYPTION_KEY=${{ secrets.ENCRYPTION_KEY }}
-          GH_APP_ID=${{ secrets.GH_APP_ID }}
-          GH_APP_PRIVATE_KEY_FILE=${{ secrets.GH_APP_PRIVATE_KEY_FILE }}
-          GH_APP_WEBHOOK_SECRET=${{ secrets.GH_APP_WEBHOOK_SECRET }}
           ENVEOF"
 
           echo "✅ .env written"
@@ -192,5 +187,5 @@ jobs:
           $SSH "pm2 save"
           sleep 5
           $SSH "curl -sf http://localhost:3001/health && echo ' ✅ Orchestration OK' || echo ' ❌ Orchestration down'"
-          $SSH "curl -sf http://localhost:3002/health && echo ' ✅ Lakehouse OK' || echo ' ❌ Lakehouse down'"
-          $SSH "curl -sf http://localhost:3003/health && echo ' ✅ PR Bot OK' || echo ' ❌ PR Bot down'"
+          $SSH "curl -sf http://localhost:3002/health && echo ' ✅ Lakehouse OK' || (echo ' ❌ Lakehouse down' && pm2 logs lakehouse --nostream --lines 30 2>&1 || true)"
+          $SSH "curl -sf http://localhost:3003/health && echo ' ✅ PR Bot OK' || (echo ' ❌ PR Bot down' && pm2 logs prbot --nostream --lines 30 2>&1 || true)"
