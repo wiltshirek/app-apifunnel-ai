@@ -4,17 +4,11 @@
     handle /internal/assets/* {
         reverse_proxy localhost:3002
     }
-    handle /api/v1/assets {
-        reverse_proxy localhost:3002
-    }
     handle /api/v1/assets/* {
         reverse_proxy localhost:3002
     }
 
     # ── PR Bot (Python :3003) ─────────────────────────────────────
-    handle /api/v1/prbot {
-        reverse_proxy localhost:3003
-    }
     handle /api/v1/prbot/* {
         reverse_proxy localhost:3003
     }
