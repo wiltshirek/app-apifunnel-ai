@@ -10,8 +10,10 @@ import base64
 import logging
 from typing import Optional
 
+from pathlib import Path as _Path
+
 from fastapi import APIRouter, File, Form, Request, UploadFile
-from fastapi.responses import JSONResponse, Response
+from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
 from ..auth import authenticate_jwt, verify_admin_key, Identity, _decode_jwt_payload, _identity_from_claims
 from ..db import get_db
@@ -28,6 +30,15 @@ from ..storage.s3 import download_file, get_presigned_url
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/assets")
+
+_OPENAPI_SPEC = _Path(__file__).resolve().parent.parent.parent / "openapi" / "lakehouse.yaml"
+
+
+@router.get("/openapi.yaml", include_in_schema=False)
+async def openapi_spec():
+    if _OPENAPI_SPEC.exists():
+        return PlainTextResponse(_OPENAPI_SPEC.read_text(), media_type="application/yaml")
+    return PlainTextResponse("spec not found", status_code=404)
 
 
 def _resolve_auth(request: Request) -> tuple[Optional[Identity], bool]:

@@ -1,18 +1,30 @@
 # Local development — HTTP only on :3000
 :3000 {
+    # ── Lakehouse (Python :3002) ──────────────────────────────────
     handle /internal/assets/* {
         reverse_proxy localhost:3002
     }
     handle /api/v1/assets/* {
         reverse_proxy localhost:3002
     }
+
+    # ── PR Bot (Python :3003) ─────────────────────────────────────
+    handle /api/v1/prbot/* {
+        reverse_proxy localhost:3003
+    }
+
+    # ── Orchestration (Node :3001) ────────────────────────────────
     handle /v1/* {
         reverse_proxy localhost:3001
     }
+
+    # ── Graphiti adapter (optional, :8001) ────────────────────────
     handle /graphiti/* {
         uri strip_prefix /graphiti
         reverse_proxy localhost:8001
     }
+
+    # ── Health checks ─────────────────────────────────────────────
     handle /health {
         reverse_proxy localhost:3001
     }
@@ -20,6 +32,12 @@
         rewrite * /health
         reverse_proxy localhost:3002
     }
+    handle /health/prbot {
+        rewrite * /health
+        reverse_proxy localhost:3003
+    }
+
+    # ── Catch-all → orchestration ─────────────────────────────────
     handle {
         reverse_proxy localhost:3001
     }

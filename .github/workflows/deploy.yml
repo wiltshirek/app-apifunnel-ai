@@ -11,6 +11,7 @@ jobs:
     outputs:
       orchestration: ${{ steps.check.outputs.orchestration }}
       lakehouse: ${{ steps.check.outputs.lakehouse }}
+      prbot: ${{ steps.check.outputs.prbot }}
       proxy: ${{ steps.check.outputs.proxy }}
     steps:
       - uses: actions/checkout@v4
@@ -26,6 +27,7 @@ jobs:
             echo "⚡ Full deploy (manual trigger or first push)"
             echo "orchestration=true" >> $GITHUB_OUTPUT
             echo "lakehouse=true"     >> $GITHUB_OUTPUT
+            echo "prbot=true"         >> $GITHUB_OUTPUT
             echo "proxy=true"         >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -37,12 +39,14 @@ jobs:
           if echo "$CHANGED" | grep -q "FORCE_ALL"; then
             echo "orchestration=true" >> $GITHUB_OUTPUT
             echo "lakehouse=true"     >> $GITHUB_OUTPUT
+            echo "prbot=true"         >> $GITHUB_OUTPUT
             echo "proxy=true"         >> $GITHUB_OUTPUT
             exit 0
           fi
 
           echo "orchestration=$(echo "$CHANGED" | grep -qE '^services/orchestration/' && echo true || echo false)" >> $GITHUB_OUTPUT
           echo "lakehouse=$(echo "$CHANGED" | grep -qE '^services/lakehouse/' && echo true || echo false)"         >> $GITHUB_OUTPUT
+          echo "prbot=$(echo "$CHANGED" | grep -qE '^services/prbot/' && echo true || echo false)"                 >> $GITHUB_OUTPUT
           echo "proxy=$(echo "$CHANGED" | grep -qE '^proxy/' && echo true || echo false)"                           >> $GITHUB_OUTPUT
 
   deploy:
@@ -50,6 +54,7 @@ jobs:
     if: >
       needs.detect-changes.outputs.orchestration == 'true' ||
       needs.detect-changes.outputs.lakehouse == 'true' ||
+      needs.detect-changes.outputs.prbot == 'true' ||
       needs.detect-changes.outputs.proxy == 'true'
     runs-on: ubuntu-latest
 
@@ -111,6 +116,13 @@ jobs:
           HETZNER_S3_SECRET=${{ secrets.HETZNER_S3_SECRET }}
           HETZNER_S3_REGION=${{ secrets.HETZNER_S3_REGION }}
           HETZNER_S3_ASSETS_BUCKET=${{ secrets.HETZNER_S3_ASSETS_BUCKET }}
+
+          PRBOT_MONGODB_URI=${{ secrets.PRBOT_MONGODB_URI }}
+          PRBOT_DB_NAME=mcp_code_execution_server
+          ENCRYPTION_KEY=${{ secrets.ENCRYPTION_KEY }}
+          GH_APP_ID=${{ secrets.GH_APP_ID }}
+          GH_APP_PRIVATE_KEY_FILE=${{ secrets.GH_APP_PRIVATE_KEY_FILE }}
+          GH_APP_WEBHOOK_SECRET=${{ secrets.GH_APP_WEBHOOK_SECRET }}
           ENVEOF"
 
           echo "✅ .env written"
@@ -147,6 +159,22 @@ jobs:
           $SSH "cd /opt/api-apifunnel && pm2 restart lakehouse --update-env 2>/dev/null || pm2 start 'uvicorn src.main:app --host 0.0.0.0 --port 3002 --workers 2' --name lakehouse --cwd services/lakehouse --interpreter none --max-memory-restart 512M"
           echo "✅ Lakehouse deployed"
 
+      - name: Deploy prbot
+        if: needs.detect-changes.outputs.prbot == 'true'
+        run: |
+          SSH="ssh -i ~/.ssh/key -o StrictHostKeyChecking=no root@$NODE_IP"
+          SCP="scp -i ~/.ssh/key -o StrictHostKeyChecking=no -r"
+
+          echo "📦 Syncing prbot..."
+          $SSH "mkdir -p /opt/api-apifunnel/services/prbot"
+          $SCP services/prbot/pyproject.toml "root@$NODE_IP:/opt/api-apifunnel/services/prbot/"
+          $SCP services/prbot/src "root@$NODE_IP:/opt/api-apifunnel/services/prbot/"
+          $SCP services/prbot/openapi "root@$NODE_IP:/opt/api-apifunnel/services/prbot/"
+
+          $SSH "cd /opt/api-apifunnel/services/prbot && pip install --no-cache-dir -q ."
+          $SSH "cd /opt/api-apifunnel && pm2 restart prbot --update-env 2>/dev/null || pm2 start 'uvicorn src.main:app --host 0.0.0.0 --port 3003 --workers 2' --name prbot --cwd services/prbot --interpreter none --max-memory-restart 512M"
+          echo "✅ PR Bot deployed"
+
       - name: Sync Caddy config
         if: needs.detect-changes.outputs.proxy == 'true'
         run: |
@@ -165,3 +193,4 @@ jobs:
           sleep 5
           $SSH "curl -sf http://localhost:3001/health && echo ' ✅ Orchestration OK' || echo ' ❌ Orchestration down'"
           $SSH "curl -sf http://localhost:3002/health && echo ' ✅ Lakehouse OK' || echo ' ❌ Lakehouse down'"
+          $SSH "curl -sf http://localhost:3003/health && echo ' ✅ PR Bot OK' || echo ' ❌ PR Bot down'"

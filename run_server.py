@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
-"""Start the lakehouse API server.
+"""Start a platform API server locally with --reload.
 
-Run from anywhere in the repo:
-    python3 run_server.py
+Usage:
+    python3 run_server.py              # lakehouse (default)
+    python3 run_server.py lakehouse    # lakehouse on :3002
+    python3 run_server.py prbot        # prbot on :3003
 """
 
 import os
@@ -11,18 +13,30 @@ import sys
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
-SERVICE_DIR = REPO_ROOT / "services" / "lakehouse"
-VENV_PYTHON = SERVICE_DIR / ".venv" / "bin" / "python3"
 
-# Use the venv python if present, otherwise fall back to whatever is running this script
-python = str(VENV_PYTHON) if VENV_PYTHON.exists() else sys.executable
+SERVICES = {
+    "lakehouse": {"port": "3002"},
+    "prbot":     {"port": "3003"},
+}
 
-os.chdir(SERVICE_DIR)
+name = sys.argv[1] if len(sys.argv) > 1 else "lakehouse"
+
+if name not in SERVICES:
+    print(f"Unknown service: {name}")
+    print(f"Available: {', '.join(SERVICES)}")
+    sys.exit(1)
+
+service_dir = REPO_ROOT / "services" / name
+venv_python = service_dir / ".venv" / "bin" / "python3"
+python = str(venv_python) if venv_python.exists() else sys.executable
+port = SERVICES[name]["port"]
+
+os.chdir(service_dir)
 
 subprocess.run([
     python, "-m", "uvicorn",
     "src.main:app",
     "--host", "0.0.0.0",
-    "--port", "3002",
+    "--port", port,
     "--reload",
 ], check=True)

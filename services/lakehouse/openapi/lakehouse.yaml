@@ -595,6 +595,20 @@ paths:
         '404':
           description: Asset not found or already permanent
 
+  /api/v1/assets/openapi.yaml:
+    get:
+      operationId: lakehouse_openapi_spec
+      summary: OpenAPI specification
+      description: Returns this YAML specification file.
+      security: []
+      responses:
+        '200':
+          description: OpenAPI 3.0 YAML
+          content:
+            application/yaml:
+              schema:
+                type: string
+
   /health:
     get:
       operationId: health_check
