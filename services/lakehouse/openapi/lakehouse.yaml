@@ -385,6 +385,83 @@ paths:
                     nullable: true
         '404':
           description: Asset not found
+    put:
+      operationId: update_asset
+      summary: Replace an asset's content
+      description: |
+        Overwrite the stored bytes of an existing asset in-place.
+        The asset_id is preserved. Provenance fields (subagent_task_id, session_id,
+        scheduled_task_id, created_at, user_id, tenant_id) are never modified.
+        Re-indexes the new content for search and updates updated_at.
+      parameters:
+        - name: asset_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - base64_content
+              properties:
+                base64_content:
+                  type: string
+                  description: New file content encoded as base64
+                filename:
+                  type: string
+                  description: Optional — rename the file. If omitted, existing filename is kept.
+      responses:
+        '200':
+          description: Updated asset metadata
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asset_id:
+                    type: string
+                    example: "ast_qqToI6wd1Bim"
+                  filename:
+                    type: string
+                  content_type:
+                    type: string
+                  size_bytes:
+                    type: integer
+                  checksum_sha256:
+                    type: string
+                  s3_key:
+                    type: string
+                  thumbnail_url:
+                    type: string
+                    nullable: true
+                  snippet:
+                    type: string
+                    nullable: true
+                  tenant_id:
+                    type: string
+                    nullable: true
+                  page_count:
+                    type: integer
+                    nullable: true
+                    description: Present for PDFs.
+                  status:
+                    type: string
+                    enum: [complete]
+                  updated_at:
+                    type: string
+                    format: date-time
+        '400':
+          description: Missing base64_content or invalid base64
+        '401':
+          description: Unauthorized
+        '404':
+          description: Asset not found
+        '500':
+          description: S3 upload failed
     delete:
       operationId: delete_asset
       summary: Delete an asset

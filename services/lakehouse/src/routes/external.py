@@ -24,6 +24,7 @@ from ..services.assets import (
     list_assets,
     promote_session_artifact,
     search_assets,
+    update_asset,
     upload_asset,
 )
 from ..storage.s3 import download_file, get_presigned_url
@@ -199,6 +200,42 @@ async def api_ingest(request: Request):
         subagent_task_id=subagent_task_id,
         scheduled_task_id=scheduled_task_id,
     )
+    if result.get("error"):
+        return JSONResponse(result, status_code=500)
+    return JSONResponse(result)
+
+
+@router.put("/{asset_id}")
+async def api_update(asset_id: str, request: Request):
+    ident, is_admin = _resolve_auth(request)
+    if not ident and not is_admin:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+
+    body = await request.json()
+    b64 = body.get("base64_content")
+    if not b64:
+        return JSONResponse({"error": "Missing base64_content"}, status_code=400)
+
+    try:
+        file_bytes = base64.b64decode(b64)
+    except Exception:
+        return JSONResponse({"error": "Invalid base64_content"}, status_code=400)
+
+    effective_user = body.get("user_id") if is_admin else (ident.user_id if ident else None)
+    if not effective_user and not is_admin:
+        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    effective_tenant = body.get("tenant_id") or (ident.tenant_id if ident else None)
+
+    db = await get_db()
+    result = await update_asset(
+        db, asset_id, file_bytes,
+        user_id=effective_user or "",
+        filename=body.get("filename"),
+        tenant_id=effective_tenant,
+        admin_access=is_admin,
+    )
+    if result is None:
+        return JSONResponse({"error": "Asset not found"}, status_code=404)
     if result.get("error"):
         return JSONResponse(result, status_code=500)
     return JSONResponse(result)

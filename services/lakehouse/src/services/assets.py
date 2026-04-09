@@ -355,6 +355,116 @@ async def search_assets(
     ]
 
 
+async def update_asset(
+    db,
+    asset_id: str,
+    file_bytes: bytes,
+    user_id: str,
+    filename: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+    admin_access: bool = False,
+) -> Optional[Dict[str, Any]]:
+    """Replace an asset's stored bytes in-place, preserving all provenance metadata."""
+    from ..storage.s3 import upload_file, get_presigned_url
+
+    query: Dict[str, Any] = {"_id": asset_id}
+    if not admin_access:
+        if not user_id:
+            return None
+        query["user_id"] = user_id
+    if tenant_id:
+        query["tenant_id"] = tenant_id
+
+    existing = await db.assets.find_one(query)
+    if not existing:
+        return None
+
+    effective_filename = filename or existing["filename"]
+    content_type = await detect_content_type(file_bytes, effective_filename)
+    checksum = hashlib.sha256(file_bytes).hexdigest()
+    s3_key = existing["s3_key"]
+
+    ok = await upload_file(
+        io.BytesIO(file_bytes), s3_key, content_type,
+        {"asset_id": asset_id, "user_id": existing["user_id"]},
+    )
+    if not ok:
+        return {"error": "S3 upload failed", "asset_id": asset_id}
+
+    thumbnail_s3_key = existing.get("thumbnail_s3_key")
+    thumb_bytes = await _generate_thumbnail(file_bytes, content_type)
+    if thumb_bytes:
+        thumb_key = thumbnail_s3_key or f"{existing['user_id']}/{asset_id}/thumb.png"
+        if await upload_file(io.BytesIO(thumb_bytes), thumb_key, "image/png", {"asset_id": asset_id, "type": "thumbnail"}):
+            thumbnail_s3_key = thumb_key
+
+    document_metadata = existing.get("document")
+    extracted_text = existing.get("extracted_text")
+    page_text_store = existing.get("page_texts")
+
+    if content_type == "application/pdf":
+        pdf = await _extract_pdf_text(file_bytes)
+        document_metadata = {
+            "page_count": pdf["page_count"],
+            "pages": [{"num": p["num"], "char_count": p["char_count"]} for p in pdf["pages"]],
+        }
+        extracted_text = pdf["full_text"]
+        page_text_store = {str(p["num"]): p["text"] for p in pdf["pages"]}
+    elif not content_type.startswith("application/pdf"):
+        # For non-PDF text types, clear stale PDF extraction if content type changed
+        if existing.get("content_type") == "application/pdf" and not content_type == "application/pdf":
+            document_metadata = None
+            extracted_text = None
+            page_text_store = None
+
+    now = datetime.utcnow()
+    updates: Dict[str, Any] = {
+        "filename": effective_filename,
+        "content_type": content_type,
+        "size_bytes": len(file_bytes),
+        "checksum_sha256": checksum,
+        "thumbnail_s3_key": thumbnail_s3_key,
+        "document": document_metadata,
+        "extracted_text": extracted_text,
+        "page_texts": page_text_store,
+        "updated_at": now,
+    }
+
+    await db.assets.update_one({"_id": asset_id}, {"$set": updates})
+
+    thumbnail_url = None
+    if thumbnail_s3_key:
+        thumbnail_url = await get_presigned_url(thumbnail_s3_key, expires_in=3600)
+
+    snippet = None
+    if extracted_text:
+        preview = extracted_text[:200].strip()
+        if len(extracted_text) > 200:
+            last_sp = preview.rfind(" ")
+            if last_sp > 100:
+                preview = preview[:last_sp]
+            snippet = preview + "..."
+        else:
+            snippet = preview
+
+    resp: Dict[str, Any] = {
+        "asset_id": asset_id,
+        "filename": effective_filename,
+        "content_type": content_type,
+        "size_bytes": len(file_bytes),
+        "checksum_sha256": checksum,
+        "s3_key": s3_key,
+        "thumbnail_url": thumbnail_url,
+        "snippet": snippet,
+        "tenant_id": existing.get("tenant_id"),
+        "status": "complete",
+        "updated_at": now.isoformat(),
+    }
+    if content_type == "application/pdf" and document_metadata:
+        resp["page_count"] = document_metadata["page_count"]
+    return resp
+
+
 async def promote_session_artifact(
     db,
     asset_id: str,
