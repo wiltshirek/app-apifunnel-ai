@@ -4,7 +4,10 @@ info:
   version: "1.0.0"
   description: |
     Semantic search over GitHub repositories. Indexes comments, docstrings,
-    READMEs, and file paths into vectors for conceptual search.
+    READMEs, and file paths into vectors for conceptual search. Use alongside
+    GitHub REST API tree and blob endpoints to navigate from conceptual hits
+    to exact file contents — this service finds where to look, GitHub REST
+    fetches what's there.
 
 servers:
   - url: https://api.apifunnel.ai
