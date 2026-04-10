@@ -124,7 +124,6 @@ jobs:
 
           ENCRYPTION_KEY=${{ secrets.ENCRYPTION_KEY }}
 
-          REPO_SEARCH_ADMIN_KEY=${{ secrets.REPO_SEARCH_ADMIN_KEY }}
           REPO_SEARCH_MONGODB_URI=${{ secrets.REPO_SEARCH_MONGODB_URI }}
           REPO_SEARCH_DB_NAME=apifunnel_repo_search
           REPO_SEARCH_S3_ENDPOINT=${{ secrets.REPO_SEARCH_S3_ENDPOINT }}

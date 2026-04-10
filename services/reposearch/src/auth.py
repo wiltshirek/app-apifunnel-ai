@@ -43,7 +43,7 @@ def _decode_jwt_payload(token: str) -> Optional[dict]:
 
 
 def verify_admin_key(request: Request) -> bool:
-    expected = os.environ.get("REPO_SEARCH_ADMIN_KEY")
+    expected = os.environ.get("REPO_SEARCH_ADMIN_KEY") or os.environ.get("MCP_ADMIN_KEY")
     if not expected:
         return False
     auth = request.headers.get("authorization") or ""
