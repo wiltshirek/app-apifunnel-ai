@@ -15,8 +15,9 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent
 
 SERVICES = {
-    "lakehouse": {"port": "3002"},
-    "prbot":     {"port": "3003"},
+    "lakehouse":   {"port": "3002"},
+    "prbot":       {"port": "3003"},
+    "reposearch":  {"port": "3004"},
 }
 
 name = sys.argv[1] if len(sys.argv) > 1 else "lakehouse"

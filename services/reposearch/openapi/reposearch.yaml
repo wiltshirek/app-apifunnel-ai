@@ -1,0 +1,229 @@
+openapi: "3.0.3"
+info:
+  title: Repo Search API
+  version: "1.0.0"
+  description: |
+    Semantic search over GitHub repositories. Indexes comments, docstrings,
+    READMEs, and file paths into vectors for conceptual search.
+
+servers:
+  - url: https://api.apifunnel.ai
+    description: Production
+
+security:
+  - AdminKey: []
+
+paths:
+  /api/v1/repo-search/search:
+    post:
+      operationId: searchRepo
+      summary: Semantic search across a repository
+      description: |
+        Search a repo by concept. If the repo hasn't been indexed yet and a
+        GitHub token is available via X-Dependency-Tokens, triggers indexing
+        first. Returns 202 if indexing is in progress.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SearchRequest"
+      responses:
+        "200":
+          description: Search results
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SearchResponse"
+        "202":
+          description: Indexing in progress
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IndexingResponse"
+        "401":
+          description: Missing admin key or GitHub token
+        "400":
+          description: Invalid request
+
+  /api/v1/repo-search/repos/{owner}/{repo}:
+    get:
+      operationId: getRepoStatus
+      summary: Get index status for a repository
+      parameters:
+        - name: owner
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: repo
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: branch
+          in: query
+          schema:
+            type: string
+            default: main
+      responses:
+        "200":
+          description: Index status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RepoStatusResponse"
+        "404":
+          description: Repo has never been indexed
+    delete:
+      operationId: deleteRepoIndex
+      summary: Delete a repository's index
+      parameters:
+        - name: owner
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: repo
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: branch
+          in: query
+          schema:
+            type: string
+            default: main
+      responses:
+        "200":
+          description: Index deleted
+        "404":
+          description: No index found
+
+  /api/v1/repo-search/repos/{owner}/{repo}/reindex:
+    post:
+      operationId: reindexRepo
+      summary: Force a full re-index of a repository
+      description: |
+        Requires a GitHub token in X-Dependency-Tokens header.
+      parameters:
+        - name: owner
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: repo
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/ReindexRequest"
+      responses:
+        "200":
+          description: Re-index complete
+        "202":
+          description: Re-indexing in progress
+        "401":
+          description: Missing admin key or GitHub token
+
+components:
+  securitySchemes:
+    AdminKey:
+      type: http
+      scheme: bearer
+      description: REPO_SEARCH_ADMIN_KEY
+
+  schemas:
+    SearchRequest:
+      type: object
+      required: [repo, query]
+      properties:
+        repo:
+          type: string
+          description: "GitHub repo in owner/name format"
+          example: "Mvp2o-ai/mcp_code_execution"
+        query:
+          type: string
+          description: "Natural language search query"
+          example: "onboarding flow for new users"
+        branch:
+          type: string
+          default: main
+        top_k:
+          type: integer
+          default: 10
+          minimum: 1
+          maximum: 50
+
+    ReindexRequest:
+      type: object
+      properties:
+        branch:
+          type: string
+          default: main
+
+    SearchResponse:
+      type: object
+      properties:
+        repo:
+          type: string
+        query:
+          type: string
+        results:
+          type: array
+          items:
+            $ref: "#/components/schemas/SearchResult"
+        index_sha:
+          type: string
+
+    SearchResult:
+      type: object
+      properties:
+        file_path:
+          type: string
+        chunk:
+          type: string
+        chunk_type:
+          type: string
+          enum: [path, docstring, comment, readme, commit]
+        score:
+          type: number
+          format: float
+
+    IndexingResponse:
+      type: object
+      properties:
+        repo:
+          type: string
+        status:
+          type: string
+          enum: [indexing]
+        message:
+          type: string
+        estimated_files:
+          type: integer
+
+    RepoStatusResponse:
+      type: object
+      properties:
+        repo:
+          type: string
+        status:
+          type: string
+          enum: [ready, indexing, error]
+        branch:
+          type: string
+        last_indexed_sha:
+          type: string
+        last_indexed_at:
+          type: string
+          format: date-time
+        file_count:
+          type: integer
+        chunk_count:
+          type: integer

@@ -23,6 +23,13 @@ services:
     env_file: .env
     restart: unless-stopped
 
+  reposearch:
+    build: services/reposearch
+    ports:
+      - "3004:3004"
+    env_file: .env
+    restart: unless-stopped
+
   caddy:
     image: caddy:2-alpine
     ports:
@@ -33,4 +40,5 @@ services:
       - orchestration
       - lakehouse
       - prbot
+      - reposearch
     restart: unless-stopped

@@ -23,6 +23,14 @@ api.apifunnel.ai {
         reverse_proxy localhost:3003
     }
 
+    # ── Repo Search (Python :3004) ─────────────────────────────────
+    handle /api/v1/repo-search {
+        reverse_proxy localhost:3004
+    }
+    handle /api/v1/repo-search/* {
+        reverse_proxy localhost:3004
+    }
+
     # ── Orchestration (Node :3001) ────────────────────────────────
     handle /v1/* {
         reverse_proxy localhost:3001
@@ -45,6 +53,10 @@ api.apifunnel.ai {
     handle /health/prbot {
         rewrite * /health
         reverse_proxy localhost:3003
+    }
+    handle /health/reposearch {
+        rewrite * /health
+        reverse_proxy localhost:3004
     }
 
     # ── Catch-all → orchestration ─────────────────────────────────

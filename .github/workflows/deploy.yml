@@ -12,6 +12,7 @@ jobs:
       orchestration: ${{ steps.check.outputs.orchestration }}
       lakehouse: ${{ steps.check.outputs.lakehouse }}
       prbot: ${{ steps.check.outputs.prbot }}
+      reposearch: ${{ steps.check.outputs.reposearch }}
       proxy: ${{ steps.check.outputs.proxy }}
     steps:
       - uses: actions/checkout@v4
@@ -28,6 +29,7 @@ jobs:
             echo "orchestration=true" >> $GITHUB_OUTPUT
             echo "lakehouse=true"     >> $GITHUB_OUTPUT
             echo "prbot=true"         >> $GITHUB_OUTPUT
+            echo "reposearch=true"    >> $GITHUB_OUTPUT
             echo "proxy=true"         >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -40,6 +42,7 @@ jobs:
             echo "orchestration=true" >> $GITHUB_OUTPUT
             echo "lakehouse=true"     >> $GITHUB_OUTPUT
             echo "prbot=true"         >> $GITHUB_OUTPUT
+            echo "reposearch=true"    >> $GITHUB_OUTPUT
             echo "proxy=true"         >> $GITHUB_OUTPUT
             exit 0
           fi
@@ -47,6 +50,7 @@ jobs:
           echo "orchestration=$(echo "$CHANGED" | grep -qE '^services/orchestration/' && echo true || echo false)" >> $GITHUB_OUTPUT
           echo "lakehouse=$(echo "$CHANGED" | grep -qE '^services/lakehouse/' && echo true || echo false)"         >> $GITHUB_OUTPUT
           echo "prbot=$(echo "$CHANGED" | grep -qE '^services/prbot/' && echo true || echo false)"                 >> $GITHUB_OUTPUT
+          echo "reposearch=$(echo "$CHANGED" | grep -qE '^services/reposearch/' && echo true || echo false)"       >> $GITHUB_OUTPUT
           echo "proxy=$(echo "$CHANGED" | grep -qE '^proxy/' && echo true || echo false)"                           >> $GITHUB_OUTPUT
 
   deploy:
@@ -55,6 +59,7 @@ jobs:
       needs.detect-changes.outputs.orchestration == 'true' ||
       needs.detect-changes.outputs.lakehouse == 'true' ||
       needs.detect-changes.outputs.prbot == 'true' ||
+      needs.detect-changes.outputs.reposearch == 'true' ||
       needs.detect-changes.outputs.proxy == 'true'
     runs-on: ubuntu-latest
 
@@ -118,6 +123,15 @@ jobs:
           HETZNER_S3_ASSETS_BUCKET=${{ secrets.HETZNER_S3_ASSETS_BUCKET }}
 
           ENCRYPTION_KEY=${{ secrets.ENCRYPTION_KEY }}
+
+          REPO_SEARCH_ADMIN_KEY=${{ secrets.REPO_SEARCH_ADMIN_KEY }}
+          REPO_SEARCH_MONGODB_URI=${{ secrets.REPO_SEARCH_MONGODB_URI }}
+          REPO_SEARCH_DB_NAME=apifunnel_repo_search
+          REPO_SEARCH_S3_ENDPOINT=${{ secrets.REPO_SEARCH_S3_ENDPOINT }}
+          REPO_SEARCH_S3_ACCESS_KEY=${{ secrets.REPO_SEARCH_S3_ACCESS_KEY }}
+          REPO_SEARCH_S3_SECRET=${{ secrets.REPO_SEARCH_S3_SECRET }}
+          REPO_SEARCH_S3_REGION=${{ secrets.REPO_SEARCH_S3_REGION }}
+          REPO_SEARCH_S3_BUCKET=apifunnel-repo-vectors
           ENVEOF"
 
           echo "✅ .env written"
@@ -171,6 +185,22 @@ jobs:
           $SSH "cd /opt/api-apifunnel && pm2 restart prbot --update-env 2>/dev/null || pm2 start 'uvicorn src.main:app --host 0.0.0.0 --port 3003 --workers 2' --name prbot --cwd services/prbot --interpreter none --max-memory-restart 512M"
           echo "✅ PR Bot deployed"
 
+      - name: Deploy reposearch
+        if: needs.detect-changes.outputs.reposearch == 'true'
+        run: |
+          SSH="ssh -i ~/.ssh/key -o StrictHostKeyChecking=no root@$NODE_IP"
+          SCP="scp -i ~/.ssh/key -o StrictHostKeyChecking=no -r"
+
+          echo "📦 Syncing reposearch..."
+          $SSH "mkdir -p /opt/api-apifunnel/services/reposearch"
+          $SCP services/reposearch/pyproject.toml "root@$NODE_IP:/opt/api-apifunnel/services/reposearch/"
+          $SCP services/reposearch/src "root@$NODE_IP:/opt/api-apifunnel/services/reposearch/"
+          $SCP services/reposearch/openapi "root@$NODE_IP:/opt/api-apifunnel/services/reposearch/"
+
+          $SSH "cd /opt/api-apifunnel/services/reposearch && pip install --no-cache-dir -q ."
+          $SSH "cd /opt/api-apifunnel && pm2 restart reposearch --update-env 2>/dev/null || pm2 start 'uvicorn src.main:app --host 0.0.0.0 --port 3004 --workers 2' --name reposearch --cwd services/reposearch --interpreter none --max-memory-restart 512M"
+          echo "✅ Repo Search deployed"
+
       - name: Sync Caddy config
         if: needs.detect-changes.outputs.proxy == 'true'
         run: |
@@ -190,3 +220,4 @@ jobs:
           $SSH "curl -sf http://localhost:3001/health && echo ' ✅ Orchestration OK' || echo ' ❌ Orchestration down'"
           $SSH "curl -sf http://localhost:3002/health && echo ' ✅ Lakehouse OK' || (echo ' ❌ Lakehouse down' && pm2 logs lakehouse --nostream --lines 30 2>&1 || true)"
           $SSH "curl -sf http://localhost:3003/health && echo ' ✅ PR Bot OK' || (echo ' ❌ PR Bot down' && pm2 logs prbot --nostream --lines 30 2>&1 || true)"
+          $SSH "curl -sf http://localhost:3004/health && echo ' ✅ Repo Search OK' || (echo ' ❌ Repo Search down' && pm2 logs reposearch --nostream --lines 30 2>&1 || true)"
