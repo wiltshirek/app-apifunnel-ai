@@ -16,8 +16,20 @@ from ..services.github import GitHubAPIError
 from ..services.indexer import check_index, get_index_status, delete_index
 from ..services.searcher import search
 
+from pathlib import Path as _Path
+from fastapi.responses import PlainTextResponse
+
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/repo-search")
+
+_OPENAPI_SPEC = _Path(__file__).resolve().parent.parent.parent / "openapi" / "reposearch.yaml"
+
+
+@router.get("/openapi.yaml", include_in_schema=False)
+async def openapi_spec():
+    if _OPENAPI_SPEC.exists():
+        return PlainTextResponse(_OPENAPI_SPEC.read_text(), media_type="application/yaml")
+    return PlainTextResponse("spec not found", status_code=404)
 
 
 def _parse_repo(repo: str) -> tuple[str, str]:
