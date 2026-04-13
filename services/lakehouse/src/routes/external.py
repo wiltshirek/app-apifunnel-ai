@@ -159,6 +159,7 @@ async def api_upload(
             tenant_id=effective_tenant,
             subagent_task_id=ident.subagent_task_id if ident else None,
             scheduled_task_id=ident.scheduled_task_id if ident else None,
+            client_meta=ident.client_meta if ident else None,
         )
         uploaded.append(result)
 
@@ -189,9 +190,11 @@ async def api_ingest(request: Request):
 
     subagent_task_id = None
     scheduled_task_id = None
+    client_meta = None
     if ident:
         subagent_task_id = ident.subagent_task_id
         scheduled_task_id = ident.scheduled_task_id
+        client_meta = ident.client_meta
 
     db = await get_db()
     result = await upload_asset(
@@ -199,6 +202,7 @@ async def api_ingest(request: Request):
         tenant_id=effective_tenant,
         subagent_task_id=subagent_task_id,
         scheduled_task_id=scheduled_task_id,
+        client_meta=client_meta,
     )
     if result.get("error"):
         return JSONResponse(result, status_code=500)

@@ -28,6 +28,7 @@ class Identity:
     email: Optional[str] = None
     subagent_task_id: Optional[str] = None
     scheduled_task_id: Optional[str] = None
+    client_meta: Optional[dict] = None
     is_admin: bool = False
 
 
@@ -57,6 +58,7 @@ def _identity_from_claims(claims: dict) -> Optional[Identity]:
         email=claims.get("email"),
         subagent_task_id=claims.get("subagent_task_id"),
         scheduled_task_id=claims.get("scheduled_task_id"),
+        client_meta=claims.get("client_meta"),
     )
 
 

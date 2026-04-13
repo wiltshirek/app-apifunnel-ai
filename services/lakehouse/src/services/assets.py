@@ -129,6 +129,7 @@ async def upload_asset(
     tenant_id: Optional[str] = None,
     subagent_task_id: Optional[str] = None,
     scheduled_task_id: Optional[str] = None,
+    client_meta: Optional[Dict[str, Any]] = None,
 ) -> Dict[str, Any]:
     from ..storage.s3 import upload_file, get_presigned_url
 
@@ -181,6 +182,8 @@ async def upload_asset(
         asset_doc["subagent_task_id"] = subagent_task_id
     if scheduled_task_id:
         asset_doc["scheduled_task_id"] = scheduled_task_id
+    if client_meta:
+        asset_doc["client_meta"] = client_meta
 
     await db.assets.insert_one(asset_doc)
 
@@ -211,6 +214,8 @@ async def upload_asset(
         resp["subagent_task_id"] = subagent_task_id
     if scheduled_task_id:
         resp["scheduled_task_id"] = scheduled_task_id
+    if client_meta:
+        resp["client_meta"] = client_meta
     return resp
 
 
@@ -293,7 +298,7 @@ async def list_assets(
         if thumb_key:
             d["thumbnail_url"] = await get_presigned_url(thumb_key, expires_in=3600)
 
-        for field in ("subagent_task_id", "scheduled_task_id", "session_id", "source", "artifact_type", "tags"):
+        for field in ("subagent_task_id", "scheduled_task_id", "session_id", "source", "artifact_type", "tags", "client_meta"):
             if a.get(field):
                 d[field] = a[field]
         assets.append(d)
