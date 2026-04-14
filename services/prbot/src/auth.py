@@ -1,11 +1,19 @@
-"""Authentication helpers — mirrors the bridge's dual-auth pattern.
+"""Authentication helpers.
 
-Internal routes:
-    Authorization: Bearer <MCP_ADMIN_KEY>
-    X-User-Token: <user JWT>  (decoded without signature verification)
+Two distinct auth mechanisms, each with a different purpose:
 
-External routes:
-    Authorization: Bearer <user JWT>
+  1. Admin key (MCP_ADMIN_KEY) — perimeter guard.
+     "Is this caller allowed to reach this API at all?"
+     The bridge and internal services send this. It protects routes from
+     the public internet. It does NOT convey identity.
+
+  2. JWT — identity.
+     "Who is the end-user?" Carried in Authorization (direct) or
+     X-User-Token (when admin key occupies Authorization). Only used
+     by routes that actually need a user_id (e.g. install-link, run lists).
+
+These are NOT fallbacks for each other. A route should explicitly require
+one, the other, or both depending on what it actually needs.
 """
 
 import base64
@@ -13,7 +21,7 @@ import json
 import logging
 import os
 from dataclasses import dataclass
-from typing import Optional
+from typing import Dict, Optional
 
 from fastapi import Request
 
@@ -28,7 +36,6 @@ class Identity:
     email: Optional[str] = None
     subagent_task_id: Optional[str] = None
     scheduled_task_id: Optional[str] = None
-    is_admin: bool = False
 
 
 def _decode_jwt_payload(token: str) -> Optional[dict]:
@@ -60,8 +67,27 @@ def _identity_from_claims(claims: dict) -> Optional[Identity]:
     )
 
 
+def extract_dependency_tokens(request: Request) -> Dict[str, str]:
+    """Parse X-Dependency-Tokens header into a dict of resolved credentials.
+
+    The bridge resolves tokens listed in the server's dependency_tokens config
+    and sends them JSON-encoded in this header.
+    """
+    raw = request.headers.get("x-dependency-tokens", "")
+    if not raw:
+        return {}
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, TypeError):
+        return {}
+
+
 def verify_admin_key(request: Request) -> bool:
-    """Check if the request carries a valid MCP_ADMIN_KEY."""
+    """Perimeter check: is the caller an authorized internal service?
+
+    Looks for MCP_ADMIN_KEY in the Authorization header.
+    This only answers "allowed in?" — it says nothing about WHO.
+    """
     expected = os.environ.get("MCP_ADMIN_KEY")
     if not expected:
         return False
@@ -74,27 +100,24 @@ def verify_admin_key(request: Request) -> bool:
     return token == expected
 
 
-def authenticate_internal(request: Request) -> Optional[Identity]:
-    """Dual-auth for /internal/* routes.
+def extract_identity(request: Request) -> Optional[Identity]:
+    """Extract user identity from the request.
 
-    1. Authorization: Bearer <MCP_ADMIN_KEY>  →  identity from X-User-Token
-    2. Else fall through to JWT in Authorization header
+    Checks two locations (in order):
+      1. X-User-Token header (when admin key occupies Authorization)
+      2. Authorization: Bearer <JWT> (direct user calls)
+
+    Returns None if no valid identity found. Does NOT check admin key —
+    that's a separate concern (use verify_admin_key for perimeter).
     """
-    if verify_admin_key(request):
-        user_token = request.headers.get("x-user-token") or ""
+    user_token = request.headers.get("x-user-token") or ""
+    if user_token:
         claims = _decode_jwt_payload(user_token)
         if claims:
             ident = _identity_from_claims(claims)
             if ident:
-                ident.is_admin = True
                 return ident
-        return None
 
-    return authenticate_jwt(request)
-
-
-def authenticate_jwt(request: Request) -> Optional[Identity]:
-    """Authenticate via Bearer JWT in Authorization header."""
     auth = request.headers.get("authorization") or ""
     if not auth.startswith("Bearer "):
         return None
@@ -102,3 +125,20 @@ def authenticate_jwt(request: Request) -> Optional[Identity]:
     if not claims:
         return None
     return _identity_from_claims(claims)
+
+
+# --- Deprecated aliases (remove once all call sites updated) ---------------
+
+def authenticate_internal(request: Request) -> Optional[Identity]:
+    """DEPRECATED — use verify_admin_key + extract_identity separately."""
+    if verify_admin_key(request):
+        ident = extract_identity(request)
+        if ident:
+            return ident
+        return None
+    return extract_identity(request)
+
+
+def authenticate_jwt(request: Request) -> Optional[Identity]:
+    """DEPRECATED — use extract_identity instead."""
+    return extract_identity(request)

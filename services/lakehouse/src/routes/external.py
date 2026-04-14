@@ -8,6 +8,8 @@ Single unified namespace. Auth via _resolve_auth handles all callers:
 
 import base64
 import logging
+import re
+import unicodedata
 from typing import Optional
 
 from pathlib import Path as _Path
@@ -31,6 +33,15 @@ from ..storage.s3 import download_file, get_presigned_url
 
 logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/v1/assets")
+
+
+def _sanitize_filename(name: str) -> str:
+    """Normalize a filename to printable ASCII so it survives HTTP headers and file systems."""
+    name = unicodedata.normalize("NFKC", name)
+    name = re.sub(r"[^\x20-\x7e]", "_", name)
+    name = re.sub(r"[_\s]{2,}", "_", name)
+    return name.strip("_ ")
+
 
 _OPENAPI_SPEC = _Path(__file__).resolve().parent.parent.parent / "openapi" / "lakehouse.yaml"
 
@@ -155,7 +166,7 @@ async def api_upload(
     for f in files:
         file_bytes = await f.read()
         result = await upload_asset(
-            db, file_bytes, f.filename or "untitled", effective_user,
+            db, file_bytes, _sanitize_filename(f.filename or "untitled"), effective_user,
             tenant_id=effective_tenant,
             subagent_task_id=ident.subagent_task_id if ident else None,
             scheduled_task_id=ident.scheduled_task_id if ident else None,
@@ -198,7 +209,7 @@ async def api_ingest(request: Request):
 
     db = await get_db()
     result = await upload_asset(
-        db, file_bytes, filename, effective_user,
+        db, file_bytes, _sanitize_filename(filename), effective_user,
         tenant_id=effective_tenant,
         subagent_task_id=subagent_task_id,
         scheduled_task_id=scheduled_task_id,

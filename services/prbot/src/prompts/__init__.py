@@ -9,3 +9,11 @@ def load_prompt(name: str) -> str:
     if not path.exists():
         raise FileNotFoundError(f"Agent prompt not found: {path}")
     return path.read_text()
+
+
+def load_asset(filename: str) -> str:
+    """Load a raw asset file by filename (e.g. 'workspace_mcp_server.py')."""
+    path = _DIR / filename
+    if not path.exists():
+        raise FileNotFoundError(f"Asset not found: {path}")
+    return path.read_text()

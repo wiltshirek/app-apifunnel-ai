@@ -5,9 +5,79 @@ info:
     Asset storage and retrieval API for document management.
     Search PDFs by content, view files for vision analysis, process with PyMuPDF.
 
-    Single unified route namespace: all endpoints are under /api/v1/assets/*.
-    Auth accepts Bearer JWT (client UI) or Bearer MCP_ADMIN_KEY + X-User-Token (bridge/MCP).
-  version: 2.0.0
+    This is an internal API that agents can discover and use like any external REST API.
+
+    ## Lakehouse as a Compute Cache for Large API Responses
+
+    The Lakehouse is not just document storage. It is a persistence layer for large
+    structured blobs that are expensive to re-fetch from source APIs (Gmail, Slack,
+    GitHub, Jira, etc.).
+
+    ### The Core Pattern: Fetch → Blob → Ingest → Reuse
+
+    1. **Fetch wide** — use the source API's native query language as a pre-filter.
+       Pull raw results (emails, issues, messages, records) in batch using asyncio.gather()
+       with a semaphore for concurrency.
+
+    2. **Build a structured blob** — serialize all records into a single .txt or .json
+       file using a consistent delimiter format:
+
+       ```
+       --- RECORD ---
+       ID: {source_id}
+       Source: {api_name}
+       Date: {timestamp}
+       Subject/Title: {label}
+       Body:
+       {content capped at 600 chars}
+       ```
+
+    3. **Ingest once** — POST /api/v1/assets/ingest (base64-encoded). The asset_id
+       is your durable handle. Store it. The blob now survives container expiry.
+
+    4. **Reuse across sessions** — any future execute_code() call retrieves the full
+       blob via get_asset_text(asset_id) in a single API call, loading it directly
+       into container memory. No re-fetching the source API.
+
+    5. **Process in-container** — all search, filtering, ranking, and transformation
+       runs as Python inside execute_code(). The container is the compute layer.
+       The Lakehouse is the cache. The source API is just the data tap.
+
+    ### Example: Searching 500 emails for a specific outcome
+
+    ```python
+    # Retrieve blob from lakehouse (one call, no Gmail re-fetch)
+    from lakehouse_api import get_asset_text
+    import re
+
+    result = await get_asset_text(asset_id='ast_...')
+    blob = result['text']
+
+    # Split into per-record chunks on the delimiter
+    records = re.split(r'(?=--- RECORD ---)', blob)
+    records = [r.strip() for r in records if r.strip()]
+
+    # Two-pass regex filter — wide net, then zoom
+    wide = re.compile(r'oauth|scope|verif|approv|CASA|LOV', re.I)
+    narrow = re.compile(r'approv|cleared|verified|LOV.*submit|success', re.I)
+
+    hits = [r for r in records if wide.search(r)]
+    strong = [r for r in hits if narrow.search(r)]
+
+    for r in strong:
+        print(r[:400])
+    ```
+
+    This pattern reduces source API calls from O(n per session) to O(1 lakehouse
+    fetch per session) while keeping all processing logic in portable Python.
+
+    ### Key insight for agents
+
+    You are never "stuck" inside a single API's query language. Gmail's q= parameter,
+    Jira's JQL, GitHub's search syntax — these are pre-filters only. The container
+    is where real search, ranking, chunking, and transformation happens. Fetch wide,
+    filter deep, in-memory. Use the Lakehouse to make that work durable.
+  version: 1.0.0
 
 servers:
   - url: http://localhost:3002
@@ -16,101 +86,7 @@ servers:
     description: Production
 
 paths:
-  /api/v1/assets:
-    get:
-      operationId: list_assets
-      summary: List user's assets
-      description: List assets with optional filtering by content type or tenant.
-      parameters:
-        - name: content_type
-          in: query
-          schema:
-            type: string
-          description: Filter by MIME type
-        - name: tenant_id
-          in: query
-          schema:
-            type: string
-          description: Filter by tenant
-        - name: limit
-          in: query
-          schema:
-            type: integer
-            default: 50
-            maximum: 200
-          description: Max results
-        - name: cursor
-          in: query
-          schema:
-            type: string
-          description: Pagination cursor (ISO timestamp of last item)
-      responses:
-        '200':
-          description: Asset list
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  assets:
-                    type: array
-                    items:
-                      type: object
-                      properties:
-                        asset_id:
-                          type: string
-                          description: Unique asset identifier. Use to call /view, /text, /bytes, /download, /promote, DELETE.
-                          example: "ast_qqToI6wd1Bim"
-                        filename:
-                          type: string
-                          example: "report.pdf"
-                        content_type:
-                          type: string
-                          description: |
-                            MIME type. Use to decide which follow-up call to make:
-                            application/pdf or application/dxf → /view for rendered pages.
-                            text/* or application/json → /text for extracted content.
-                            anything else → /bytes for raw bytes.
-                          example: "application/pdf"
-                        size_bytes:
-                          type: integer
-                          example: 204800
-                        tenant_id:
-                          type: string
-                          nullable: true
-                        page_count:
-                          type: integer
-                          nullable: true
-                          description: Present for PDFs only.
-                        thumbnail_url:
-                          type: string
-                          nullable: true
-                          description: Pre-signed S3 URL for thumbnail preview (expires in 1 hour).
-                        subagent_task_id:
-                          type: string
-                          nullable: true
-                          description: Set when the asset was uploaded by a subagent run.
-                        scheduled_task_id:
-                          type: string
-                          nullable: true
-                          description: Set when the asset was uploaded by a scheduled task execution.
-                        session_id:
-                          type: string
-                          nullable: true
-                          description: Present if the asset is an ephemeral session artifact (not yet promoted).
-                        created_at:
-                          type: string
-                          format: date-time
-                  next_cursor:
-                    type: string
-                    nullable: true
-                    description: Pass as cursor param to get the next page.
-                  has_more:
-                    type: boolean
-        '401':
-          description: Unauthorized
-
-  /api/v1/assets/search:
+  /internal/assets/search:
     post:
       operationId: search_assets
       summary: Search assets by text content
@@ -155,154 +131,37 @@ paths:
                   properties:
                     asset_id:
                       type: string
-                      description: Use to call /view, /text, /bytes, /download.
-                      example: "ast_qqToI6wd1Bim"
                     filename:
                       type: string
-                      example: "contract_draft.pdf"
                     content_type:
                       type: string
-                      description: |
-                        Use to decide which follow-up call to make:
-                        application/pdf or application/dxf → /view.
-                        text/* or application/json → /text.
-                        anything else → /bytes.
-                      example: "application/pdf"
-                    size_bytes:
-                      type: integer
                     page_count:
                       type: integer
-                      nullable: true
-                      description: Present for PDFs.
-                    tenant_id:
-                      type: string
-                      nullable: true
                     snippet:
                       type: string
-                      nullable: true
-                      description: Up to 200 chars of matching extracted text.
                     score:
                       type: number
-                      description: Full-text relevance score (higher is better).
-                    created_at:
-                      type: string
-                      format: date-time
         '401':
           description: Unauthorized
 
-  /api/v1/assets/ingest:
-    post:
-      operationId: ingest_asset
-      summary: Upload a new asset (base64)
-      description: |
-        Upload a file as a JSON payload with base64-encoded content.
-        The file is stored, content-typed, indexed for search, and returned with a unique asset_id.
-        Subagent provenance (subagent_task_id, scheduled_task_id) is read from the caller's JWT
-        and stored on the asset document automatically.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required:
-                - filename
-                - base64_content
-              properties:
-                filename:
-                  type: string
-                  description: Original filename with extension
-                  example: "weekly_report.pdf"
-                base64_content:
-                  type: string
-                  description: File content encoded as base64
-                user_id:
-                  type: string
-                  description: Required for admin callers. Ignored for JWT callers.
-                tenant_id:
-                  type: string
-                  description: Optional tenant scope
-      responses:
-        '200':
-          description: Upload successful
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  asset_id:
-                    type: string
-                    description: Unique identifier. Use to call /view, /text, /bytes, /download, /promote, DELETE.
-                    example: "ast_qqToI6wd1Bim"
-                  filename:
-                    type: string
-                    example: "report.pdf"
-                  content_type:
-                    type: string
-                    example: "application/pdf"
-                  size_bytes:
-                    type: integer
-                    example: 204800
-                  checksum_sha256:
-                    type: string
-                    description: SHA-256 hex digest of the file content.
-                  s3_key:
-                    type: string
-                    description: Internal S3 object key.
-                  thumbnail_url:
-                    type: string
-                    nullable: true
-                    description: Pre-signed S3 URL for thumbnail (expires 1 hour). Present for PDFs and images.
-                  snippet:
-                    type: string
-                    nullable: true
-                    description: First ~200 chars of extracted text. Present for PDFs.
-                  tenant_id:
-                    type: string
-                    nullable: true
-                  page_count:
-                    type: integer
-                    nullable: true
-                    description: Present for PDFs.
-                  subagent_task_id:
-                    type: string
-                    nullable: true
-                    description: Populated from the caller's JWT if present.
-                  scheduled_task_id:
-                    type: string
-                    nullable: true
-                    description: Populated from the caller's JWT if present.
-                  status:
-                    type: string
-                    enum: [complete]
-                  created_at:
-                    type: string
-                    format: date-time
-        '400':
-          description: Missing required fields or invalid base64
-        '401':
-          description: Unauthorized
-
-  /api/v1/assets/{asset_id}:
+  /internal/assets/{asset_id}:
     get:
       operationId: get_asset_metadata
       summary: Get asset metadata
-      description: |
-        Returns full metadata for an asset including page info for PDFs.
-        By default, extracted_text and page_texts are omitted (can be large).
-        Pass include_page_text=true to include them.
+      description: Get full metadata for an asset including page info for PDFs
       parameters:
         - name: asset_id
           in: path
           required: true
           schema:
             type: string
+          description: Asset ID
         - name: include_page_text
           in: query
           schema:
             type: boolean
             default: false
-          description: Include extracted_text and page_texts fields
+          description: Include extracted text per page (can be large)
       responses:
         '200':
           description: Asset metadata
@@ -313,179 +172,27 @@ paths:
                 properties:
                   asset_id:
                     type: string
-                    example: "ast_qqToI6wd1Bim"
                   filename:
                     type: string
-                    example: "report.pdf"
                   content_type:
                     type: string
-                    description: |
-                      MIME type. Use to decide which follow-up call to make:
-                      application/pdf or application/dxf → /view.
-                      text/* or application/json → /text.
-                      anything else → /bytes.
-                    example: "application/pdf"
                   size_bytes:
                     type: integer
-                    example: 204800
-                  checksum_sha256:
-                    type: string
-                  s3_key:
-                    type: string
-                  tenant_id:
-                    type: string
-                    nullable: true
-                  thumbnail_url:
-                    type: string
-                    nullable: true
-                    description: Pre-signed S3 URL (expires 1 hour). Present for PDFs and images.
-                  document:
-                    type: object
-                    nullable: true
-                    description: Present for PDFs.
-                    properties:
-                      page_count:
-                        type: integer
-                      pages:
-                        type: array
-                        items:
-                          type: object
-                          properties:
-                            num:
-                              type: integer
-                            char_count:
-                              type: integer
-                  subagent_task_id:
-                    type: string
-                    nullable: true
-                  scheduled_task_id:
-                    type: string
-                    nullable: true
-                  session_id:
-                    type: string
-                    nullable: true
-                    description: Present if asset is an ephemeral session artifact.
-                  extracted_text:
-                    type: string
-                    nullable: true
-                    description: Only present when include_page_text=true.
-                  page_texts:
-                    type: object
-                    nullable: true
-                    description: Page-keyed text map. Only present when include_page_text=true.
-                  processing_status:
-                    type: string
-                    enum: [complete, processing, failed]
+                  page_count:
+                    type: integer
                   created_at:
                     type: string
                     format: date-time
-                  updated_at:
-                    type: string
-                    format: date-time
-                    nullable: true
         '404':
           description: Asset not found
-    put:
-      operationId: update_asset
-      summary: Replace an asset's content
-      description: |
-        Overwrite the stored bytes of an existing asset in-place.
-        The asset_id is preserved. Provenance fields (subagent_task_id, session_id,
-        scheduled_task_id, created_at, user_id, tenant_id) are never modified.
-        Re-indexes the new content for search and updates updated_at.
-      parameters:
-        - name: asset_id
-          in: path
-          required: true
-          schema:
-            type: string
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required:
-                - base64_content
-              properties:
-                base64_content:
-                  type: string
-                  description: New file content encoded as base64
-                filename:
-                  type: string
-                  description: Optional — rename the file. If omitted, existing filename is kept.
-      responses:
-        '200':
-          description: Updated asset metadata
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  asset_id:
-                    type: string
-                    example: "ast_qqToI6wd1Bim"
-                  filename:
-                    type: string
-                  content_type:
-                    type: string
-                  size_bytes:
-                    type: integer
-                  checksum_sha256:
-                    type: string
-                  s3_key:
-                    type: string
-                  thumbnail_url:
-                    type: string
-                    nullable: true
-                  snippet:
-                    type: string
-                    nullable: true
-                  tenant_id:
-                    type: string
-                    nullable: true
-                  page_count:
-                    type: integer
-                    nullable: true
-                    description: Present for PDFs.
-                  status:
-                    type: string
-                    enum: [complete]
-                  updated_at:
-                    type: string
-                    format: date-time
-        '400':
-          description: Missing base64_content or invalid base64
-        '401':
-          description: Unauthorized
-        '404':
-          description: Asset not found
-        '500':
-          description: S3 upload failed
-    delete:
-      operationId: delete_asset
-      summary: Delete an asset
-      parameters:
-        - name: asset_id
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '200':
-          description: Deleted
-        '404':
-          description: Not found
 
-  /api/v1/assets/{asset_id}/view:
+  /internal/assets/{asset_id}/view:
     get:
       operationId: get_asset_view
       summary: Get asset content for vision models
       description: |
         Returns base64-encoded content for vision analysis.
-        For PDFs, returns individual pages as PNG images (up to max_pages).
-        For DXF/DWG, renders the drawing to a PNG and returns it as a single page.
-        For other formats, returns raw base64 bytes.
+        For PDFs, can return full PDF or individual pages as images.
       parameters:
         - name: asset_id
           in: path
@@ -496,15 +203,21 @@ paths:
           in: query
           schema:
             type: string
-            enum: [pages, auto]
+            enum: [pdf, pages, auto]
             default: auto
           description: Output format
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+          description: Specific page number for 'pages' format
         - name: max_pages
           in: query
           schema:
             type: integer
             default: 5
-          description: Max pages to return for PDFs
+          description: Max pages for 'auto' format
       responses:
         '200':
           description: Asset content (base64)
@@ -515,44 +228,36 @@ paths:
                 properties:
                   asset_id:
                     type: string
+                  filename:
+                    type: string
                   content_type:
                     type: string
                   format:
                     type: string
-                  total_pages:
-                    type: integer
-                    description: Total pages (DXF always 1)
+                  base64:
+                    type: string
                   page_count:
                     type: integer
-                    description: Alias for total_pages (PDFs)
                   pages:
                     type: array
-                    description: Rendered pages
+                    description: For 'pages' format
                     items:
                       type: object
                       properties:
                         page_num:
                           type: integer
-                        page:
-                          type: integer
-                          description: Alias for page_num (PDFs)
                         base64:
                           type: string
                         width:
                           type: integer
                         height:
                           type: integer
-                  base64:
-                    type: string
-                    description: Raw bytes for non-renderable formats
-        '404':
-          description: Asset not found
 
-  /api/v1/assets/{asset_id}/bytes:
+  /internal/assets/{asset_id}/bytes:
     get:
       operationId: get_asset_bytes
       summary: Get raw asset bytes
-      description: Get base64-encoded raw bytes for PyMuPDF/Pillow/ezdxf processing in code execution.
+      description: Get base64-encoded raw bytes for PyMuPDF/Pillow processing
       parameters:
         - name: asset_id
           in: path
@@ -575,28 +280,127 @@ paths:
                     type: integer
                   base64:
                     type: string
-        '404':
-          description: Asset not found
 
-  /api/v1/assets/{asset_id}/text:
+  /internal/assets:
+    post:
+      operationId: upload_asset
+      summary: Upload a new asset
+      description: |
+        Upload a file to the lakehouse as a base64-encoded payload.
+        The file is stored, indexed for search, and returned with a unique asset_id.
+
+        Primary use case: persist a structured blob of API results (emails, issues,
+        messages, records) so it survives container expiry and can be retrieved in
+        future sessions via get_asset_text() without re-fetching the source API.
+        This is the Ingest step in the Fetch → Blob → Ingest → Reuse pattern.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - filename
+                - base64_content
+              properties:
+                filename:
+                  type: string
+                  description: Original filename (e.g., "report.pdf")
+                  example: "weekly_report.pdf"
+                base64_content:
+                  type: string
+                  description: File content encoded as base64 string
+      responses:
+        '200':
+          description: Upload successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asset_id:
+                    type: string
+                  filename:
+                    type: string
+                  content_type:
+                    type: string
+                  size_bytes:
+                    type: integer
+                  status:
+                    type: string
+                    example: "complete"
+        '400':
+          description: Missing required fields or invalid base64
+        '401':
+          description: Unauthorized
+    get:
+      operationId: list_assets
+      summary: List user's assets
+      description: List assets with optional filtering by type or tenant
+      parameters:
+        - name: content_type
+          in: query
+          schema:
+            type: string
+          description: Filter by MIME type
+        - name: tenant_id
+          in: query
+          schema:
+            type: string
+          description: Filter by tenant
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 200
+          description: Max results
+        - name: cursor
+          in: query
+          schema:
+            type: string
+          description: Pagination cursor
+      responses:
+        '200':
+          description: Asset list
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  assets:
+                    type: array
+                  next_cursor:
+                    type: string
+                  has_more:
+                    type: boolean
+
+  /internal/assets/{asset_id}/text:
     get:
       operationId: get_asset_text
-      summary: Get full extracted text from an asset
+      summary: Get full text content from an asset
       description: |
-        Format-agnostic text extraction. Access the content via result['text'].
-        PDFs: all pages concatenated.
-        Text files (CSV, JSON, Markdown, plain text, HTML, XML, YAML, etc.): raw content.
-        Binary/visual files (images, DXF/DWG): returns 400 — use get_asset_view instead.
-        No truncation — full text is always returned.
+        Format-agnostic text extraction. Returns a JSON object — access the content via result['text'].
+        PDFs: text field contains all extracted text concatenated across all pages.
+        Text files (CSV, JSON, Markdown, plain text, HTML, XML, YAML, etc.): text field contains raw content.
+        Binary/visual files (images, DXF/DWG): returns an error directing to get_asset_view.
+        No truncation — the full text is always returned.
+
+        Primary use case: retrieve a previously ingested blob of structured records
+        (emails, issues, messages, etc.) directly into container memory for in-process
+        filtering, regex search, or transformation — without re-fetching the source API.
+        Pair with execute_code() for all compute. This is the Lakehouse cache retrieval
+        step in the Fetch → Blob → Ingest → Reuse pattern described in the API description.
       parameters:
         - name: asset_id
           in: path
           required: true
           schema:
             type: string
+          description: Asset ID
       responses:
         '200':
-          description: Full text content
+          description: Full text content of the asset
           content:
             application/json:
               schema:
@@ -610,18 +414,125 @@ paths:
                     type: string
                   text:
                     type: string
+                    description: Full text content of the asset
                   char_count:
                     type: integer
+                    description: Character count of the returned text
         '400':
           description: Text extraction not supported for this content type
         '404':
           description: Asset not found
 
+  /api/v1/assets:
+    get:
+      operationId: list_assets_external
+      summary: List assets (external)
+      description: List user's assets via JWT authentication
+      parameters:
+        - name: content_type
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 50
+            maximum: 200
+        - name: cursor
+          in: query
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Asset list
+        '401':
+          description: Unauthorized
+
+  /api/v1/assets/search:
+    get:
+      operationId: search_assets_external
+      summary: Search assets (external)
+      description: Full-text search via JWT authentication
+      parameters:
+        - name: q
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Search query
+        - name: content_type
+          in: query
+          schema:
+            type: string
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+      responses:
+        '200':
+          description: Search results
+        '401':
+          description: Unauthorized
+
+  /api/v1/assets/upload:
+    post:
+      operationId: upload_asset_external
+      summary: Upload asset (multipart)
+      description: Upload a file via multipart form data with JWT authentication
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+              properties:
+                file:
+                  type: string
+                  format: binary
+      responses:
+        '200':
+          description: Upload successful
+        '401':
+          description: Unauthorized
+
+  /api/v1/assets/{asset_id}:
+    get:
+      operationId: get_asset_external
+      summary: Get asset metadata (external)
+      parameters:
+        - name: asset_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Asset metadata
+        '404':
+          description: Not found
+    delete:
+      operationId: delete_asset_external
+      summary: Delete asset (external)
+      parameters:
+        - name: asset_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Deleted
+        '404':
+          description: Not found
+
   /api/v1/assets/{asset_id}/download:
     get:
-      operationId: download_asset
+      operationId: download_asset_external
       summary: Download raw file bytes
-      description: Returns the original file as a binary response with correct Content-Type.
       parameters:
         - name: asset_id
           in: path
@@ -638,53 +549,6 @@ paths:
                 format: binary
         '404':
           description: Not found
-
-  /api/v1/assets/{asset_id}/promote:
-    post:
-      operationId: promote_asset
-      summary: Promote ephemeral session artifact to permanent storage
-      description: |
-        Removes session metadata (session_id, is_ephemeral) from an asset document,
-        making it permanently visible in the user's asset library.
-        Called by the client UI "Save Permanently" action.
-      parameters:
-        - name: asset_id
-          in: path
-          required: true
-          schema:
-            type: string
-      responses:
-        '200':
-          description: Promoted successfully
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  success:
-                    type: boolean
-                  asset_id:
-                    type: string
-                  message:
-                    type: string
-        '401':
-          description: Unauthorized
-        '404':
-          description: Asset not found or already permanent
-
-  /api/v1/assets/openapi.yaml:
-    get:
-      operationId: lakehouse_openapi_spec
-      summary: OpenAPI specification
-      description: Returns this YAML specification file.
-      security: []
-      responses:
-        '200':
-          description: OpenAPI 3.0 YAML
-          content:
-            application/yaml:
-              schema:
-                type: string
 
   /health:
     get:
@@ -712,9 +576,11 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
-      description: |
-        Bearer JWT for client UI calls.
-        Or Bearer MCP_ADMIN_KEY with X-User-Token header for bridge/MCP calls.
+      description: JWT token for external routes
+    AdminKey:
+      type: http
+      scheme: bearer
+      description: MCP_ADMIN_KEY for internal routes (with X-User-Token header for identity)
 
 security:
   - BearerAuth: []

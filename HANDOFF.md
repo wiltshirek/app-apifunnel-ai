@@ -104,9 +104,131 @@ curl -s http://localhost:3002/internal/assets/search?q=test \
 curl -s http://localhost:3001/v1/openapi | head -c 200
 ```
 
+### Obtaining test tokens
+
+To test authenticated endpoints locally, ask the MCP execution team (bridge) to mint a
+JWT for the API server team. The token must have a `sub` claim matching a user_id that
+has a GitHub OAuth token stored in the `user_api_tokens` collection.
+
+The bridge team mints these with `POST /api/v1/internal/mint-token`. Tokens typically
+expire in 30 days. If your token is expired, request a new one.
+
+### PR Bot prerequisites (target repository)
+
+The target repository must have these settings enabled **before** the first dispatch:
+
+1. **Allow GitHub Actions to create and approve pull requests**
+   - Go to: `https://github.com/<owner>/<repo>/settings/actions`
+   - Under "Workflow permissions", check **"Allow GitHub Actions to create and approve pull requests"**
+   - Without this, the `gh pr create` step will fail with a permissions error
+
+2. **Branch protection (recommended)**
+   - Enable branch protection on `main`/`master` to require PRs
+   - The dispatch response includes a `branch_unprotected` warning if this is missing
+
+### Testing PR Bot locally
+
+Start the prbot service, then use curl with the dual-auth pattern:
+
+```bash
+# 1. Start prbot
+cd services/prbot
+source .venv/bin/activate
+cd ../..
+set -a && source .env && set +a
+cd services/prbot && uvicorn src.main:app --host 0.0.0.0 --port 3003 --reload &
+cd ../..
+
+# 2. Health check
+curl -s http://localhost:3003/health
+
+# 3. Set auth variables
+ADMIN_KEY=$(grep MCP_ADMIN_KEY .env | cut -d= -f2-)
+USER_JWT="<paste JWT from bridge team>"
+
+# 4. Test dispatch (infra generates branch name)
+curl -s -X POST http://localhost:3003/api/v1/prbot/dispatch \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "X-User-Token: $USER_JWT" \
+  -d '{
+    "repo": "wiltshirek/one_mcp",
+    "task_context": "Add a README",
+    "base_branch": "main",
+    "github_token": "<GITHUB_PAT>",
+    "api_key": "<ANTHROPIC_API_KEY>"
+  }' | python3 -m json.tool
+
+# 5. Test dispatch WITH branch_name override
+curl -s -X POST http://localhost:3003/api/v1/prbot/dispatch \
+  -H "Content-Type: application/json" \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "X-User-Token: $USER_JWT" \
+  -d '{
+    "repo": "wiltshirek/one_mcp",
+    "task_context": "Add a README",
+    "base_branch": "main",
+    "branch_name": "feat/test-branch",
+    "github_token": "<GITHUB_PAT>",
+    "api_key": "<ANTHROPIC_API_KEY>"
+  }' | python3 -m json.tool
+
+# 6. List run reports for a repo
+curl -s "http://localhost:3003/api/v1/prbot/runs?repo=wiltshirek/one_mcp" \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "X-User-Token: $USER_JWT" \
+  | python3 -m json.tool
+
+# 7. Get run status by dispatch_id (returned from dispatch)
+curl -s "http://localhost:3003/api/v1/prbot/runs/<DISPATCH_ID>" \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "X-User-Token: $USER_JWT" \
+  | python3 -m json.tool
+
+# 8. Get run status by GitHub Actions run_id (also works)
+curl -s "http://localhost:3003/api/v1/prbot/runs/<RUN_ID>" \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "X-User-Token: $USER_JWT" \
+  | python3 -m json.tool
+
+# 9. Fetch last page of logs (quick tail check)
+curl -s "http://localhost:3003/api/v1/prbot/runs/<DISPATCH_ID>/logs?page=-1" \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "X-User-Token: $USER_JWT" \
+  | python3 -m json.tool
+
+# 10. Fetch all logs in one call (for archival)
+curl -s "http://localhost:3003/api/v1/prbot/runs/<DISPATCH_ID>/logs?all=true" \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "X-User-Token: $USER_JWT" \
+  | python3 -m json.tool
+
+# 11. Paginated log access
+curl -s "http://localhost:3003/api/v1/prbot/runs/<DISPATCH_ID>/logs?page=1&page_size=100" \
+  -H "Authorization: Bearer $ADMIN_KEY" \
+  -H "X-User-Token: $USER_JWT" \
+  | python3 -m json.tool
+```
+
+**Expected responses:**
+
+- First call after workflow update → `"status": "repo_just_configured"` with retry hint
+- Second call (after ~8s) → `"status": "dispatched"` with `dispatch_id`, `run_url` and `branch_name`
+- Dispatch now returns a `dispatch_id` (e.g. `dsp_a1b2c3d4e5f6g7h8`) — use this to poll
+- `GET /runs/{dispatch_id}` → run status + `logs.available`, `logs.total_lines`, `logs.total_pages`
+- `GET /runs/{id}/logs?page=-1` → last page of agent output
+- `GET /runs/{id}/logs?all=true` → every log line in one response
+- The workflow run on GitHub shows all steps: checkout, setup, inject artifacts,
+  strip credentials, run agent, create draft PR, report run
+- After the workflow completes, the run report appears in `GET /runs?repo=...`
+
+**Credentials:** Can be passed directly in the request body (`github_token`, `api_key`)
+or via `X-Dependency-Tokens` header (keys: `github_rest`, `agent_key`) when called
+through the bridge.
+
 ### Testing checklist
 
-- [ ] `GET /health` on both services returns OK
+- [ ] `GET /health` on all services returns OK
 - [ ] MongoDB connects on startup (check logs for "Connected to MongoDB")
 - [ ] Lakehouse: `POST /api/v1/assets/upload` with a file → creates asset
 - [ ] Lakehouse: `GET /api/v1/assets` → lists assets
@@ -116,6 +238,18 @@ curl -s http://localhost:3001/v1/openapi | head -c 200
 - [ ] Lakehouse: `DELETE /api/v1/assets/{id}` → removes from S3 + MongoDB
 - [ ] Lakehouse: Internal routes work with admin key + X-User-Token
 - [ ] Orchestration: `/v1/openapi` returns YAML
+- [ ] PR Bot: `GET /health` on :3003 returns OK
+- [ ] PR Bot: `POST /api/v1/prbot/dispatch` without auth → 401
+- [ ] PR Bot: `POST /api/v1/prbot/dispatch` with auth + credentials → returns `dispatch_id` + dispatches workflow
+- [ ] PR Bot: `POST /api/v1/prbot/dispatch` with `branch_name` → dispatches with branch override
+- [ ] PR Bot: `POST /api/v1/prbot/dispatch` without `branch_name` → generates deterministic name
+- [ ] PR Bot: `GET /api/v1/prbot/runs?repo=...` → lists run reports (no log_lines in response)
+- [ ] PR Bot: `GET /api/v1/prbot/runs/{dispatch_id}` → run status + `logs` summary block
+- [ ] PR Bot: `GET /api/v1/prbot/runs/{run_id}` → same endpoint, accepts run_id too
+- [ ] PR Bot: `GET /api/v1/prbot/runs/{id}/logs?page=-1` → last page of agent output
+- [ ] PR Bot: `GET /api/v1/prbot/runs/{id}/logs?all=true` → all log lines in one response
+- [ ] PR Bot: `GET /api/v1/prbot/runs/{id}/logs?page=1&page_size=100` → paginated logs
+- [ ] PR Bot: Workflow calls back to `/callback` on completion → logs decoded + stored as log_lines
 - [ ] Auth: requests without auth → 401/403
 
 ---

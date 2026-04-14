@@ -1,37 +1,29 @@
 # Workspace Agent Instructions
 
-You are an autonomous PR agent running inside a GitHub Actions workflow.
-Your job is to complete the task described in the prompt, then open a pull request.
+You are an autonomous coding agent running in a CI environment.
+Your job is to complete the task described in the prompt, then submit your work.
+
+## Important: You have an MCP tool called `submit_pr`
+
+An MCP server named "workspace" is configured in `.mcp.json`. It provides one tool:
+
+- **`submit_pr`** — accepts `title` (string), `summary` (string), and `branch_name` (string).
+
+You MUST call `submit_pr` when you are done. If you don't, no PR will be created and your work is lost.
 
 ## Workflow
 
-1. **Understand the task** — Read the prompt carefully. Explore the repo to understand the codebase.
-2. **Make changes** — Edit files to complete the task. Run tests/builds if applicable.
-3. **Create a branch, commit, push, and open a PR** — This is mandatory. Every run must end with an open PR.
-
-## Git & PR procedure
-
-```bash
-git checkout -b <branch-name>
-git add -A
-git commit -m "<conventional commit message>"
-git push origin <branch-name>
-gh pr create --title "<title>" --body "<body>"
-```
-
-- Branch name: use a short descriptive slug like `fix/rate-limiting` or `feat/add-doc-comments`
-- Commit message: use conventional commits (feat:, fix:, docs:, chore:, refactor:)
-- PR title: concise, under 70 characters
-- PR body: include a `## Summary` section describing what changed and why
-- Always push and open the PR. Do not skip this step.
-- If `gh pr create` fails, diagnose the error and retry. Common fix: ensure the branch was pushed first.
-- The workflow has already checked out the intended base branch for this task. Create your feature branch from the currently checked out branch.
-- Open the PR back into that checked out base branch.
-- Do not try to manage workflow files, dispatch behavior, or repository automation unless the task explicitly asks for it.
+1. **Understand the task** — Read the prompt carefully. Explore the repo.
+2. **Make changes** — Edit files to complete the task. Run tests if applicable.
+3. **Submit** — Call the `submit_pr` MCP tool with:
+   - `title`: concise PR title, under 70 chars, conventional commit prefix (e.g. `feat:`, `fix:`)
+   - `summary`: markdown body describing what changed and why
+   - `branch_name`: short slug like `feat/add-rate-limiting` (no spaces)
 
 ## Rules
 
-- Do NOT push directly to the default branch. Always use a feature branch.
-- Do NOT force push.
+- Do NOT run `git push`, `git commit`, `gh pr create`, or any git write operations.
+  You do not have git credentials. Infrastructure handles all git operations after you submit.
+- Do NOT modify `.github/workflows/` files unless the task explicitly requires it.
 - Do NOT modify files unrelated to the task.
-- If tests exist, run them before committing. If they fail, fix the issue or note it in the PR body.
+- If tests exist, run them before submitting.

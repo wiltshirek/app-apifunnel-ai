@@ -14,12 +14,13 @@ All router endpoints share prefix `/api/v1/prbot`.
 
 | Method | Path | Auth | Purpose |
 |--------|------|------|---------|
-| POST | `/preflight` | JWT or admin-key | Check dispatch prerequisites (GitHub connected, LLM key stored) |
-| POST | `/dispatch` | JWT or admin-key | Sync workflow file, mint job token, fire `workflow_dispatch` |
-| POST | `/callback` | JWT or admin-key | Receive workflow completion callbacks (placeholder) |
+| POST | `/dispatch` | JWT or admin-key | Sync workflow file, fire `workflow_dispatch`. Returns `dispatch_id`. |
+| POST | `/callback` | `report_token` | Receive workflow completion report. Decodes logs into structured lines. |
+| GET | `/runs` | JWT or admin-key | List run reports for a repo (paginated, no log lines). |
+| GET | `/runs/{id}` | JWT or admin-key | Run status + metadata + log summary. `{id}` = `dispatch_id` or `run_id`. |
+| GET | `/runs/{id}/logs` | JWT or admin-key | Paginated log lines. Supports `page`, `page_size`, `page=-1`, `all=true`. |
 | GET | `/install-link` | JWT only | Return GitHub App installation URL with `state=user_id` |
 | GET | `/install-callback` | None (GitHub redirect) | Link App installation to platform user, 302 back to UI |
-| GET | `/job-secrets` | Job token (query param) | Exchange single-use token for LLM API key — called by the workflow runner |
 | POST | `/webhook` | HMAC (`X-Hub-Signature-256`) | Receive GitHub App installation lifecycle events |
 
 App-level (no prefix):
@@ -40,15 +41,23 @@ Exception: `/job-secrets` uses a single-use token as the sole credential. `/webh
 
 ## Dispatch Flow
 
-1. Resolve GitHub token — persisted OAuth first, GitHub App installation token fallback.
-2. Load `workspace_agent_key` (user's LLM API key, AES-256-GCM encrypted at rest).
-3. Mint a single-use job token (UUID, stored with encrypted API key, TTL-indexed).
-4. Sync workflow YAML to `.github/workflows/mcp-workspace.yml` on the repo's default branch.
-5. Fire `workflow_dispatch` with inputs: `task_context`, `job_token`, `platform_url`, `target_branch`.
+1. Credentials (github_token, api_key) come from request body or `X-Dependency-Tokens` header.
+2. Sync workflow YAML to `.github/workflows/mcp-workspace.yml` on the repo's default branch.
+3. Generate `dispatch_id` (`dsp_` + random token) and one-time `report_token`.
+4. Fire `workflow_dispatch` with inputs: `task_context`, `api_key`, `base_branch`, `branch_name`, `callback_url`, `report_token`.
+5. Store dispatch record in MongoDB with `status: "dispatched"`.
 6. Best-effort: wait 2s, fetch the Actions run URL.
-7. Return 202 with `run_url` (or `repo_just_configured` if the workflow was just created — caller retries after ~8s).
+7. Return 202 with `dispatch_id`, `run_url`, `branch_name` (or `repo_just_configured` if the workflow was just created — caller retries after ~8s).
 
-The workflow runner calls back to `/api/v1/prbot/job-secrets` to exchange its token for the API key, then runs the coding agent.
+## Run Lifecycle
+
+```
+dispatched → queued → in_progress → completed | failed | timed_out | cancelled
+```
+
+The workflow's final step POSTs a structured report to `/callback` with `report_token` auth. On receipt, the server decodes `agent_log_b64` into structured `log_lines` for paginated retrieval, merges step outcomes, and clears the token.
+
+Use `GET /runs/{dispatch_id}` to poll status and `GET /runs/{dispatch_id}/logs` to fetch agent output.
 
 ## Database
 
@@ -58,10 +67,12 @@ Collections used:
 
 | Collection | Module | Purpose |
 |------------|--------|---------|
-| `user_api_tokens` | `database/user_tokens.py` | GitHub OAuth tokens (read-only, bridge owns refresh) |
-| `service_api_keys` | `database/api_keys.py` | Encrypted LLM API keys per user |
-| `workspace_job_tokens` | `database/job_tokens.py` | Single-use tokens with TTL |
+| `prbot_run_reports` | `database/run_reports.py` | Dispatch records, callback reports, structured log lines |
 | `github_app_installations` | `database/github_app_installations.py` | App install ↔ user ↔ repo mapping |
+
+Indexes on `prbot_run_reports`:
+- `{ dispatch_id: 1 }` unique sparse — lookup by our correlation key
+- `{ repo: 1, dispatched_at: -1 }` — list runs for a repo, newest first
 
 ## Env Vars
 
@@ -70,13 +81,12 @@ Collections used:
 | `PRBOT_MONGODB_URI` | No | `MONGODB_URI` | Mongo connection string |
 | `PRBOT_DB_NAME` | No | `mcp_code_execution_server` | Database name |
 | `MCP_ADMIN_KEY` | Yes | — | Admin bearer token |
-| `ENCRYPTION_KEY` | Yes | — | Base64-encoded 32-byte AES key for API key encryption |
+| `PRBOT_BASE_URL` | No | `https://api.apifunnel.ai` | Base URL for callback_url sent to workflow |
 | `GH_APP_ID` | Yes | — | GitHub App ID |
 | `GH_APP_PRIVATE_KEY_FILE` | Yes* | — | Path to RSA PEM (or use `GH_APP_PRIVATE_KEY` inline) |
 | `GH_APP_PRIVATE_KEY` | Yes* | — | RSA PEM string (alternative to file) |
 | `GH_APP_WEBHOOK_SECRET` | No | — | HMAC secret for webhook verification (if unset, all webhooks accepted) |
 | `WORKSPACE_WORKFLOW_FILE` | No | `mcp-workspace.yml` | Workflow filename synced to repos |
-| `MCP_BRIDGE_BASE_URL` | No | `https://tool.apifunnel.ai` | Base URL passed to workflow for job-secrets fetch |
 | `WORKSPACE_INSTALL_RETURN_URL` | No | `https://app.apifunnel.ai/free-tools/prbot/app` | Redirect target after App install |
 
 ## OpenAPI Spec
@@ -91,24 +101,23 @@ services/prbot/
 ├── pyproject.toml
 ├── openapi/prbot.yaml
 └── src/
-    ├── main.py                  # App, lifespan, CORS, health, spec route
+    ├── main.py                  # App, lifespan, CORS, health, index creation
     ├── auth.py                  # JWT decode, admin key, Identity dataclass
     ├── db.py                    # Motor client singleton
     ├── database/
-    │   ├── api_keys.py          # AES-GCM decrypt of service API keys
-    │   ├── user_tokens.py       # GitHub OAuth token lookup
-    │   ├── job_tokens.py        # Mint/consume single-use tokens
+    │   ├── run_reports.py       # Dispatch records, log processing, paginated queries
     │   └── github_app_installations.py
     ├── routes/
     │   └── external.py          # All HTTP handlers (APIRouter prefix /api/v1/prbot)
     ├── services/
-    │   ├── dispatch.py          # Workflow sync + dispatch logic
-    │   ├── preflight.py         # Prerequisite checks + formatters
+    │   ├── dispatch.py          # Workflow sync + dispatch logic (generates dispatch_id)
     │   ├── github_api.py        # httpx GitHub REST helpers
     │   └── github_app.py        # App JWT, installation tokens, webhook HMAC
     └── prompts/
-        ├── __init__.py          # load_prompt()
-        └── coding_agent.md      # Injected into workflow as CLAUDE.md
+        ├── __init__.py          # load_prompt(), load_asset()
+        ├── coding_agent.md      # Injected into workflow as CLAUDE.md
+        ├── mcp_config.json      # MCP server config injected into workflow
+        └── workspace_mcp_server.py  # MCP server for submit_pr tool
 ```
 
 ## Local Dev

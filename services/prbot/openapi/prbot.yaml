@@ -6,107 +6,43 @@ info:
     from natural language task descriptions.
 
     Zero setup: no Dockerfile, no SSH keys.
-    Two prerequisites (checked automatically): GitHub connected via OAuth, LLM API key stored.
+    Credentials (GitHub token, LLM API key) are supplied via request body
+    or X-Dependency-Tokens header.
 
     Single unified route namespace: all endpoints are under /api/v1/prbot/*.
-    Auth accepts Bearer JWT (client UI) or Bearer MCP_ADMIN_KEY + X-User-Token (bridge/MCP).
-  version: 2.0.0
+    Auth accepts Bearer JWT (client UI) or Bearer MCP_ADMIN_KEY + X-User-Token (internal).
+
+    Run lifecycle: dispatched → queued → in_progress → completed | failed | timed_out | cancelled.
+    Use dispatch_id (returned from /dispatch) to poll status and fetch logs.
+  version: 5.0.0
 
 servers:
   - url: https://api.apifunnel.ai
     description: Production
   - url: http://localhost:3003
-    description: Local development (override via .env)
+    description: Local development
 
 paths:
-  /api/v1/prbot/preflight:
-    post:
-      operationId: prbot_preflight
-      summary: Check all dispatch prerequisites
-      description: |
-        **Call this before every dispatch.** Returns structured JSON with step-by-step
-        status plus a `markdown` field with rich guidance for agent callers.
-
-        Steps checked (in order):
-          1. GitHub connected (persisted OAuth token or App installation fallback)
-          2. LLM API key stored (workspace_agent_key in service_api_keys)
-
-        Response always returns HTTP 200. Check `all_clear` to know if dispatch is safe.
-        If `all_clear` is false, read `markdown` and guide the user through the failing
-        steps before attempting dispatch.
-
-        Each step includes `status`, `code`, and `details` with machine-readable
-        data (URLs, API call specs, guidance text) so the app can render the right UI.
-      requestBody:
-        required: true
-        content:
-          application/json:
-            schema:
-              type: object
-              required:
-                - repo
-              properties:
-                repo:
-                  type: string
-                  description: Target repository in "owner/repo" format
-                  example: "acme-org/backend-service"
-                ref:
-                  type: string
-                  description: Git branch or tag (default "main")
-                  default: "main"
-                user_id:
-                  type: string
-                  description: Required when using admin-key auth
-      responses:
-        '200':
-          description: Pre-flight results (always 200 — check all_clear field)
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/PreflightResponse'
-        '400':
-          description: Missing required fields
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '401':
-          description: Unauthorized
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '500':
-          description: Internal server error
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
   /api/v1/prbot/dispatch:
     post:
       operationId: prbot_dispatch
       summary: Dispatch a GitHub Actions run to create a pull request
       description: |
-        Resolves a GitHub token (OAuth first, App fallback), syncs the workflow template,
-        mints a single-use job token, and fires workflow_dispatch.
+        Syncs the workflow template to the target repo and fires workflow_dispatch
+        with credentials passed directly (no DB lookups).
 
-        Returns 202 immediately with a GitHub Actions run URL. The workflow runs
-        asynchronously — open run_url to monitor progress.
+        Returns 202 immediately with a dispatch_id (our correlation key) and a
+        GitHub Actions run URL. The workflow runs asynchronously.
 
-        Pre-flight order (each is a hard stop):
-          1. GitHub token resolved (persisted OAuth or App installation)
-          2. workspace_agent_key (LLM API key) loaded
-          3. Single-use job token minted
-          4. Workflow file synced (created or updated)
-          5. workflow_dispatch fired
+        Use the dispatch_id to poll GET /runs/{id} for status and
+        GET /runs/{id}/logs for agent output.
+
+        A one-time report_token is generated and passed to the workflow. On completion
+        (success or failure), the workflow calls /callback with the full run report.
 
         Two success statuses:
-          - "dispatched": workflow fired, github.run_url available, poll for completion
-          - "repo_just_configured": workflow file just created, GitHub needs ~5s to register it — retry dispatch
-
-        Known error codes (all 422):
-          github_not_connected, agent_key_required, workflow_sync_failed, github_api_error
+          - "dispatched": workflow fired, dispatch_id + github.run_url available
+          - "repo_just_configured": workflow file just created, GitHub needs ~8s — retry
       requestBody:
         required: true
         content:
@@ -123,21 +59,31 @@ paths:
                   example: "acme-org/backend-service"
                 task_context:
                   type: string
-                  description: |
-                    Natural language description of the coding task for the AI agent.
-                    Be specific about what changes to make, which files to touch, and
-                    what the PR should accomplish.
-                  example: "Add rate limiting middleware to the /api/orders endpoint. Use a sliding window of 100 requests per minute per user."
-                ref:
+                  description: Natural language description of the coding task for the AI agent.
+                  example: "Add rate limiting middleware to the /api/orders endpoint."
+                base_branch:
                   type: string
-                  description: Git branch or tag to base the PR on (default "main")
+                  description: Branch to checkout from and PR into (default "main")
                   default: "main"
-                  example: "main"
+                branch_name:
+                  type: string
+                  description: |
+                    Optional feature branch name for the PR.
+                    If omitted, a deterministic name is generated from the task context.
+                  example: "feat/add-rate-limiting"
+                github_token:
+                  type: string
+                  description: |
+                    GitHub PAT or installation token. Falls back to X-Dependency-Tokens
+                    header (github_rest key) if not provided.
+                api_key:
+                  type: string
+                  description: |
+                    LLM API key (Anthropic or Google AI). Falls back to X-Dependency-Tokens
+                    header (agent_key key) if not provided.
       responses:
         '202':
-          description: |
-            Workflow dispatched (status="dispatched") or workflow file just created
-            and needs a few seconds before dispatch can proceed (status="repo_just_configured").
+          description: Workflow dispatched or repo just configured.
           content:
             application/json:
               schema:
@@ -151,26 +97,7 @@ paths:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
         '401':
-          description: Unauthorized — missing or invalid admin key / X-User-Token
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '422':
-          description: |
-            Pre-flight check failed. Inspect "code" to determine what needs to be fixed.
-          content:
-            application/json:
-              schema:
-                oneOf:
-                  - $ref: '#/components/schemas/GithubNotConnectedError'
-                  - $ref: '#/components/schemas/AgentKeyRequiredError'
-                  - $ref: '#/components/schemas/WorkflowSyncFailedError'
-                  - $ref: '#/components/schemas/GithubApiError'
-                discriminator:
-                  propertyName: code
-        '500':
-          description: Internal server error
+          description: Unauthorized — missing or invalid credentials
           content:
             application/json:
               schema:
@@ -179,21 +106,25 @@ paths:
   /api/v1/prbot/callback:
     post:
       operationId: prbot_callback
-      summary: Receive completion callback from a workflow run (placeholder)
+      summary: Receive run report from a completed workflow
       description: |
-        Called by the GitHub Actions workflow (or a future orchestrator) when a
-        workflow run completes. Currently logs the payload and returns 200 ack.
+        Called by the GitHub Actions workflow's final step (runs on success or failure).
+        Validates the one-time report_token, then merges the run report into MongoDB.
+
+        The report includes: agent logs (base64), step outcomes, PR status/URL,
+        commit SHA, errors, and timing metadata. Agent logs are decoded and stored
+        as structured line arrays for paginated retrieval via GET /runs/{id}/logs.
+
+        No JWT required — authenticated via the report_token generated at dispatch time.
       requestBody:
-        required: false
+        required: true
         content:
           application/json:
             schema:
-              type: object
-              description: Free-form payload (run_id, pr_url, status, etc.)
-              additionalProperties: true
+              $ref: '#/components/schemas/CallbackReport'
       responses:
         '200':
-          description: Acknowledged
+          description: Report accepted and persisted
           content:
             application/json:
               schema:
@@ -202,17 +133,154 @@ paths:
                   success:
                     type: boolean
                     example: true
-                  status:
-                    type: string
-                    example: "ack"
-        '400':
-          description: Invalid JSON body
+        '401':
+          description: Invalid or expired report_token
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/prbot/runs:
+    get:
+      operationId: prbot_list_runs
+      summary: List run reports for a repository
+      description: |
+        Returns recent run reports for a given repo, newest first.
+        Used by the app UI to show workflow history and results.
+        Log lines are excluded from list responses for performance.
+      parameters:
+        - name: repo
+          in: query
+          required: true
+          schema:
+            type: string
+          description: Repository in "owner/repo" format
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            default: 20
+            maximum: 100
+        - name: skip
+          in: query
+          schema:
+            type: integer
+            default: 0
+      responses:
+        '200':
+          description: List of run reports
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  repo:
+                    type: string
+                  count:
+                    type: integer
+                  reports:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/RunSummary'
         '401':
-          description: Unauthorized — missing or invalid admin key
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/prbot/runs/{id}:
+    get:
+      operationId: prbot_get_run
+      summary: Get run status and metadata
+      description: |
+        Returns the full run record with a log availability summary.
+        Accepts either a dispatch_id (dsp_...) or a GitHub Actions run_id
+        as the path parameter — the endpoint figures out which one it is.
+
+        The response includes a `logs` block summarizing availability and
+        line count. Use GET /runs/{id}/logs to fetch actual log lines.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: dispatch_id (dsp_...) or GitHub Actions run_id
+          example: "dsp_a1b2c3d4e5f6g7h8"
+      responses:
+        '200':
+          description: Run status and metadata
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RunStatusResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Run not found
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+
+  /api/v1/prbot/runs/{id}/logs:
+    get:
+      operationId: prbot_get_run_logs
+      summary: Retrieve log lines for a run
+      description: |
+        Returns agent output log lines for a completed (or in-progress) run.
+        Three retrieval modes:
+          - all=true: every line in one response (for archival, programmatic use)
+          - page=N: specific page of lines (1-indexed)
+          - page=-1: last page only (quick tail check)
+
+        Accepts dispatch_id (dsp_...) or run_id as the path parameter.
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: dispatch_id (dsp_...) or GitHub Actions run_id
+        - name: all
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: If true, returns all log lines in one response. Ignores page/page_size.
+        - name: page
+          in: query
+          schema:
+            type: integer
+            default: 1
+          description: Page number (1-indexed). Use -1 for last page. Ignored when all=true.
+        - name: page_size
+          in: query
+          schema:
+            type: integer
+            default: 100
+            maximum: 500
+          description: Lines per page. Ignored when all=true.
+      responses:
+        '200':
+          description: Log lines
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/LogsResponse'
+        '401':
+          description: Unauthorized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ErrorResponse'
+        '404':
+          description: Run not found or no logs available
           content:
             application/json:
               schema:
@@ -224,10 +292,7 @@ paths:
       summary: Get GitHub App installation URL
       description: |
         Returns a GitHub App installation URL with the user's ID embedded as the
-        `state` parameter. The user opens this URL to install the GitHub App on
-        their account or organization.
-
-        Requires a user JWT (admin-key auth is not supported for this endpoint).
+        `state` parameter. Requires a user JWT.
       responses:
         '200':
           description: Install URL
@@ -238,7 +303,6 @@ paths:
                 properties:
                   install_url:
                     type: string
-                    description: GitHub App installation URL with state=user_id
                     example: "https://github.com/apps/apifunnel-workspace/installations/new?state=usr_abc123"
         '401':
           description: Unauthorized — JWT required
@@ -253,82 +317,30 @@ paths:
       summary: Handle GitHub App post-installation redirect
       description: |
         GitHub redirects the user here after installing the App. Links the
-        installation to the platform user (via state param) and redirects
-        the user back to the app UI.
-
-        Not called by API consumers directly — this is the GitHub App callback URL.
+        installation to the platform user and redirects back to the app UI.
+        Not called by API consumers directly.
       parameters:
         - name: installation_id
           in: query
           required: true
           schema:
             type: string
-          description: GitHub installation ID (set by GitHub redirect)
         - name: state
           in: query
           required: true
           schema:
             type: string
-          description: Platform user_id (embedded during install-link)
+          description: Platform user_id
         - name: setup_action
           in: query
           schema:
             type: string
-          description: GitHub setup action (e.g. "install")
       security: []
       responses:
         '302':
-          description: Redirect to app UI with installation_linked=1
+          description: Redirect to app UI
         '400':
           description: Missing installation_id or state
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-
-  /api/v1/prbot/job-secrets:
-    get:
-      operationId: prbot_job_secrets
-      summary: Exchange a single-use job token for LLM API key
-      description: |
-        Called from inside the GitHub Actions workflow runner. Consumes a
-        single-use job token and returns the user's encrypted LLM API key.
-
-        No JWT or admin-key auth — the job token IS the credential.
-        Tokens are single-use and expire after a TTL.
-      parameters:
-        - name: token
-          in: query
-          required: true
-          schema:
-            type: string
-          description: Single-use job token minted during dispatch
-        - name: repo
-          in: query
-          required: true
-          schema:
-            type: string
-          description: Repository in "owner/repo" format (must match the token)
-      security: []
-      responses:
-        '200':
-          description: API key returned
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  ANTHROPIC_API_KEY:
-                    type: string
-                    description: The user's LLM API key
-        '400':
-          description: Missing token or repo
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
-        '401':
-          description: Invalid, expired, or already-consumed token
           content:
             application/json:
               schema:
@@ -339,13 +351,8 @@ paths:
       operationId: prbot_webhook
       summary: Receive GitHub App webhook events
       description: |
-        Handles GitHub App installation lifecycle events:
-        installation (created, deleted, suspended, unsuspended) and
-        installation_repositories (added, removed).
-
-        Authenticated via HMAC signature (X-Hub-Signature-256) using
-        GH_APP_WEBHOOK_SECRET. Not called by API consumers — GitHub
-        sends events here automatically.
+        Handles GitHub App installation lifecycle events.
+        Authenticated via HMAC signature (X-Hub-Signature-256).
       security: []
       responses:
         '200':
@@ -358,28 +365,13 @@ paths:
                   status:
                     type: string
                     example: "ok"
-        '400':
-          description: Invalid JSON payload
-          content:
-            application/json:
-              schema:
-                $ref: '#/components/schemas/ErrorResponse'
         '401':
           description: Invalid HMAC signature
-          content:
-            application/json:
-              schema:
-                type: object
-                properties:
-                  error:
-                    type: string
-                    example: "invalid signature"
 
   /api/v1/prbot/openapi.yaml:
     get:
       operationId: prbot_openapi_spec
       summary: OpenAPI specification
-      description: Returns this YAML specification file.
       security: []
       responses:
         '200':
@@ -411,67 +403,266 @@ paths:
 
 components:
   schemas:
-
-    # ── Preflight response ─────────────────────────────────────────────────────
-
-    PreflightResponse:
+    CallbackReport:
       type: object
+      required:
+        - repo
+        - run_id
+        - report_token
       properties:
-        all_clear:
-          type: boolean
-          description: True only if both steps are complete. Safe to dispatch only when true.
         repo:
           type: string
-        ref:
+          example: "acme-org/backend-service"
+        run_id:
           type: string
-        steps_complete:
-          type: integer
-          example: 1
-        steps_total:
-          type: integer
-          example: 2
+          description: GitHub Actions run ID
+          example: "12345678901"
+        run_url:
+          type: string
+          example: "https://github.com/acme-org/backend-service/actions/runs/12345678901"
+        run_number:
+          type: string
+        base_branch:
+          type: string
+          example: "main"
+        branch_name:
+          type: string
+          example: "prbot/add-rate-limiting-1712345678"
+        agent:
+          type: string
+          enum: [claude, gemini]
+        report_token:
+          type: string
+          description: One-time token generated at dispatch for callback auth
+        status:
+          type: string
+          description: Overall run outcome
+          enum: [success, failed]
         steps:
+          type: object
+          properties:
+            agent:
+              type: object
+              properties:
+                exit_code:
+                  type: string
+                  enum: [success, failure, cancelled, skipped]
+            create_pr:
+              type: object
+              properties:
+                exit_code:
+                  type: string
+                  enum: [success, failure, cancelled, skipped]
+                pr_status:
+                  type: string
+                  enum: [created, no_agent_result, no_changes, protected_branch, pr_create_failed, skipped]
+                pr_url:
+                  type: string
+                commit_sha:
+                  type: string
+        agent_log_b64:
+          type: string
+          description: Base64-encoded agent stdout/stderr (up to 500KB). Decoded and stored as structured log lines on the server.
+
+    RunSummary:
+      type: object
+      description: Lightweight run record returned in list responses (no log lines).
+      properties:
+        dispatch_id:
+          type: string
+          example: "dsp_a1b2c3d4e5f6g7h8"
+        run_id:
+          type: string
+          nullable: true
+          example: "12345678901"
+        repo:
+          type: string
+          example: "acme-org/backend-service"
+        status:
+          type: string
+          enum: [dispatched, queued, in_progress, completed, failed, timed_out, cancelled]
+        base_branch:
+          type: string
+          example: "main"
+        branch_name:
+          type: string
+          example: "prbot/add-readme-1712345678"
+        agent:
+          type: string
+          enum: [claude, gemini]
+          nullable: true
+        task_context:
+          type: string
+          description: First 500 chars of the task description.
+        run_url:
+          type: string
+          nullable: true
+        dispatched_at:
+          type: string
+          format: date-time
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+        steps:
+          $ref: '#/components/schemas/StepOutcomes'
+
+    RunStatusResponse:
+      type: object
+      description: Full run record with log availability summary.
+      properties:
+        dispatch_id:
+          type: string
+          example: "dsp_a1b2c3d4e5f6g7h8"
+        run_id:
+          type: string
+          description: GitHub Actions run ID. Null until the callback is received.
+          example: "12345678901"
+          nullable: true
+        repo:
+          type: string
+          example: "acme-org/backend-service"
+        status:
+          type: string
+          enum: [dispatched, queued, in_progress, completed, failed, timed_out, cancelled]
+          description: Current lifecycle status of the run.
+        base_branch:
+          type: string
+          example: "main"
+        branch_name:
+          type: string
+          example: "prbot/add-readme-1712345678"
+        agent:
+          type: string
+          enum: [claude, gemini]
+          nullable: true
+        task_context:
+          type: string
+          description: First 500 chars of the original task description.
+        run_url:
+          type: string
+          nullable: true
+          example: "https://github.com/acme-org/backend-service/actions/runs/12345678901"
+        dispatched_at:
+          type: string
+          format: date-time
+        started_at:
+          type: string
+          format: date-time
+          nullable: true
+        completed_at:
+          type: string
+          format: date-time
+          nullable: true
+        steps:
+          $ref: '#/components/schemas/StepOutcomes'
+        logs:
+          type: object
+          description: Log availability summary. Use GET /runs/{id}/logs to fetch actual lines.
+          properties:
+            available:
+              type: boolean
+              description: True if log lines exist and can be fetched.
+            total_lines:
+              type: integer
+              description: Number of log lines stored. 0 if not yet available.
+              example: 2847
+            total_pages:
+              type: integer
+              description: Based on default page_size of 100.
+              example: 29
+            truncated:
+              type: boolean
+              description: True if original output exceeded storage limit and was truncated.
+
+    LogsResponse:
+      type: object
+      description: Paginated (or full) log lines for a run.
+      properties:
+        dispatch_id:
+          type: string
+          example: "dsp_a1b2c3d4e5f6g7h8"
+        run_id:
+          type: string
+          nullable: true
+          example: "12345678901"
+        status:
+          type: string
+          enum: [dispatched, queued, in_progress, completed, failed, timed_out, cancelled]
+        total_lines:
+          type: integer
+          example: 2847
+        total_pages:
+          type: integer
+          description: Total pages at current page_size. Null when all=true.
+          nullable: true
+          example: 29
+        page:
+          type: integer
+          description: Current page number. Null when all=true.
+          nullable: true
+          example: 1
+        page_size:
+          type: integer
+          description: Lines per page. Null when all=true.
+          nullable: true
+          example: 100
+        truncated:
+          type: boolean
+          description: True if original output exceeded storage limit and was truncated.
+          example: false
+        lines:
           type: array
           items:
-            type: object
-            properties:
-              number:
-                type: integer
-                description: Step number (1–2)
-              name:
-                type: string
-                description: Human-readable step label
-              status:
-                type: string
-                enum: [ok, missing]
-                description: |
-                  ok      — step is complete, no action needed
-                  missing — step is not complete, requires action
-              code:
-                type: string
-                description: |
-                  Snake_case code for the issue. Empty string when status is "ok".
-                  Known codes: github_not_connected, agent_key_required
-              details:
-                type: object
-                description: |
-                  Step-specific data. Contents vary by code:
+            $ref: '#/components/schemas/LogLine'
 
-                  github_not_connected:
-                    oauth_url (string), guidance (string)
-
-                  agent_key_required:
-                    user_guidance (string), store_endpoint (object with method/path/body/note)
-                additionalProperties: true
-        markdown:
+    LogLine:
+      type: object
+      properties:
+        n:
+          type: integer
+          description: Line number (1-indexed, sequential)
+          example: 1
+        t:
           type: string
-          description: Rich markdown guidance for LLM agent callers.
+          format: date-time
+          nullable: true
+          description: Timestamp if available from agent stream output
+        text:
+          type: string
+          description: The log line content
+          example: "Installing @anthropic-ai/claude-code..."
 
-    # ── Success responses ──────────────────────────────────────────────────────
+    StepOutcomes:
+      type: object
+      nullable: true
+      properties:
+        agent:
+          type: object
+          properties:
+            exit_code:
+              type: string
+              enum: [success, failure, cancelled, skipped]
+        create_pr:
+          type: object
+          properties:
+            exit_code:
+              type: string
+              enum: [success, failure, cancelled, skipped]
+            pr_status:
+              type: string
+              enum: [created, no_agent_result, no_changes, protected_branch, pr_create_failed, skipped]
+            pr_url:
+              type: string
+              nullable: true
+              example: "https://github.com/acme-org/backend-service/pull/42"
+            commit_sha:
+              type: string
+              nullable: true
 
     DispatchedResponse:
       type: object
-      description: Workflow fired successfully. Monitor github.run_url for progress.
+      required: [success, status, dispatch_id, repo, branch_name]
       properties:
         success:
           type: boolean
@@ -479,47 +670,36 @@ components:
         status:
           type: string
           enum: [dispatched]
+        dispatch_id:
+          type: string
+          description: Unique correlation ID for this run. Use to poll status and fetch logs.
+          example: "dsp_a1b2c3d4e5f6g7h8"
         repo:
           type: string
           example: "acme-org/backend-service"
-        ref:
+        base_branch:
           type: string
           example: "main"
+        branch_name:
+          type: string
+          description: Effective branch name (user-supplied or generated)
+          example: "prbot/add-readme-1712345678"
         workflow_ref:
           type: string
-          description: The branch the workflow was dispatched on (usually the default branch).
           example: "main"
         github:
           type: object
           properties:
             run_url:
               type: string
-              description: Direct link to the GitHub Actions run
               example: "https://github.com/acme-org/backend-service/actions/runs/12345"
         warnings:
           type: array
-          description: |
-            Non-fatal advisory notices. Dispatch still proceeds.
-            Currently only "branch_unprotected" is emitted.
           items:
-            type: object
-            properties:
-              code:
-                type: string
-                example: "branch_unprotected"
-              message:
-                type: string
-                example: "Branch 'main' has no protection rules. The agent could push directly to it."
-              settings_url:
-                type: string
-                example: "https://github.com/acme-org/backend-service/settings/branches"
+            $ref: '#/components/schemas/Warning'
 
     RepoJustConfiguredResponse:
       type: object
-      description: |
-        The workflow file was just committed to the repo for the first time.
-        GitHub needs a few seconds to register it before workflow_dispatch can proceed.
-        Wait ~5 seconds and retry dispatch — the next call will return "dispatched".
       properties:
         success:
           type: boolean
@@ -529,31 +709,22 @@ components:
           enum: [repo_just_configured]
         message:
           type: string
-          example: "The MCP workspace workflow was just committed to this repository. GitHub needs a few seconds to register it. Please retry dispatch."
         repo:
           type: string
-          example: "acme-org/backend-service"
-        ref:
+        base_branch:
           type: string
-          example: "main"
         workflow_file:
           type: string
-          description: Path of the workflow file that was just committed
           example: ".github/workflows/mcp-workspace.yml"
         workflow_ref:
           type: string
-          description: The default branch the workflow was committed to.
-          example: "main"
         github:
           type: object
           properties:
             commit_url:
               type: string
-              description: URL to view the commit on GitHub
-              example: "https://github.com/acme-org/backend-service/commits/main"
         retry:
           type: object
-          description: Retry instructions for callers.
           properties:
             action:
               type: string
@@ -567,126 +738,23 @@ components:
             reason:
               type: string
 
-    # ── 422 error responses ────────────────────────────────────────────────────
-
-    GithubNotConnectedError:
+    Warning:
       type: object
-      description: |
-        No GitHub token available. The user must connect GitHub via OAuth.
-        Direct the user to resolution.oauth_url, then retry dispatch.
       properties:
-        success:
-          type: boolean
-          example: false
-        error:
-          type: string
-          example: "No GitHub token available. Connect GitHub via OAuth to enable workspace dispatch."
         code:
           type: string
-          enum: [github_not_connected]
-        repo:
+        message:
           type: string
-        resolution:
-          type: object
-          properties:
-            action:
-              type: string
-              example: "connect_github"
-            description:
-              type: string
-              example: "Connect your GitHub account via OAuth so the platform can access your repository."
-            oauth_url:
-              type: string
-              example: "/api/oauth/start/github_rest_api"
-
-    AgentKeyRequiredError:
-      type: object
-      description: |
-        The user has not stored an LLM API key (Anthropic or Google AI).
-        Use resolution.endpoint with resolution.payload to store it, then retry dispatch.
-      properties:
-        success:
-          type: boolean
-          example: false
-        error:
+        settings_url:
           type: string
-          example: "An LLM API key is required to run the coding agent."
-        code:
-          type: string
-          enum: [agent_key_required]
-        repo:
-          type: string
-        resolution:
-          type: object
-          properties:
-            action:
-              type: string
-              example: "store_key"
-            endpoint:
-              type: string
-              example: "POST /api/service-api-keys"
-            payload:
-              type: object
-              properties:
-                service_name:
-                  type: string
-                  example: "workspace_agent_key"
-                api_key:
-                  type: string
-                  example: "sk-ant-..."
-            note:
-              type: string
-              example: "Use your Anthropic key (sk-ant-...) for Claude Code, or your Google AI key for Gemini CLI."
-
-    WorkflowSyncFailedError:
-      type: object
-      description: The server failed to sync the workflow YAML to the repo via the Contents API.
-      properties:
-        success:
-          type: boolean
-          example: false
-        error:
-          type: string
-          example: "Failed to sync workflow file via GitHub API."
-        code:
-          type: string
-          enum: [workflow_sync_failed]
-        repo:
-          type: string
-        ref:
-          type: string
-
-    GithubApiError:
-      type: object
-      description: The workflow_dispatch API call to GitHub failed.
-      properties:
-        success:
-          type: boolean
-          example: false
-        error:
-          type: string
-        code:
-          type: string
-          enum: [github_api_error]
-        repo:
-          type: string
-        ref:
-          type: string
-
-    # ── Generic error ──────────────────────────────────────────────────────────
 
     ErrorResponse:
       type: object
       properties:
-        success:
-          type: boolean
-          example: false
         error:
           type: string
-          description: Human-readable error message
         code:
           type: string
-          description: Snake_case error code
 
   securitySchemes:
     BearerAuth:
@@ -695,7 +763,7 @@ components:
       bearerFormat: JWT
       description: |
         Bearer JWT for client UI calls.
-        Or Bearer MCP_ADMIN_KEY with X-User-Token header for bridge/MCP calls.
+        Or Bearer MCP_ADMIN_KEY with X-User-Token header for internal calls.
 
 security:
   - BearerAuth: []

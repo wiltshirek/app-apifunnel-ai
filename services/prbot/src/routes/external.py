@@ -1,10 +1,14 @@
 """PR Bot routes (/api/v1/prbot/*).
 
-All endpoints accept both auth patterns:
-  - Bearer JWT (user-facing)
-  - MCP_ADMIN_KEY + X-User-Token (sandbox / internal callers)
+Auth strategy per route:
 
-No /internal/ prefix — same URLs for everyone, auth determines identity.
+  /dispatch      — admin key (perimeter). No user identity needed.
+  /callback      — report_token (one-time secret). No admin key or JWT.
+  /runs, /runs/X — admin key OR JWT (perimeter + optional identity for UI).
+  /install-link  — JWT required (needs user_id for GitHub state param).
+  /webhook       — HMAC signature (X-Hub-Signature-256).
+  /install-cb    — no auth (GitHub redirect, state param carries user_id).
+  /openapi.yaml  — public.
 """
 
 import json
@@ -16,7 +20,7 @@ from typing import Optional
 from fastapi import APIRouter, Request
 from fastapi.responses import JSONResponse, PlainTextResponse, RedirectResponse
 
-from ..auth import authenticate_internal, authenticate_jwt, verify_admin_key, Identity
+from ..auth import extract_dependency_tokens, extract_identity, verify_admin_key, Identity
 from ..services.github_app import APP_INSTALL_URL, verify_webhook_signature
 
 logger = logging.getLogger(__name__)
@@ -38,79 +42,29 @@ _RETURN_URL = os.environ.get(
 )
 
 
-def _resolve_identity(request: Request) -> tuple[Optional[Identity], bool]:
-    """Return (identity, is_admin). Accepts admin-key or JWT."""
-    ident = authenticate_internal(request)
-    if ident and ident.is_admin:
-        return ident, True
+def _require_perimeter(request: Request) -> bool:
+    """Check that the caller passed the admin key OR a valid JWT.
 
-    ident = authenticate_jwt(request)
-    if ident:
-        return ident, False
-
-    return None, False
-
-
-def _effective_user_id(
-    ident: Optional[Identity],
-    is_admin: bool,
-    body: dict,
-) -> Optional[str]:
-    """Resolve the acting user_id. Admins must supply user_id in the body."""
-    if is_admin:
-        return body.get("user_id") or (ident.user_id if ident else None)
-    return ident.user_id if ident else None
-
-
-@router.post("/preflight")
-async def prbot_preflight(request: Request):
-    """Check all dispatch prerequisites.
-
-    Returns structured JSON with step-by-step status + a markdown summary
-    for agent callers. Both fields are always present.
+    Admin key = internal service (bridge). JWT = direct user call.
+    Either proves you're an authorized caller. This is the perimeter check.
     """
-    from ..services.preflight import format_json, format_markdown, run_preflight
-
-    ident, is_admin = _resolve_identity(request)
-    if not ident:
-        return JSONResponse(
-            {"error": "Unauthorized", "code": "unauthorized"}, status_code=401,
-        )
-
-    try:
-        body = await request.json()
-    except Exception:
-        return JSONResponse({"error": "Invalid JSON body", "code": "bad_request"}, status_code=400)
-
-    repo = body.get("repo")
-    if not repo:
-        return JSONResponse({"error": "Missing required field: repo", "code": "bad_request"}, status_code=400)
-
-    ref = body.get("ref", "main")
-    user_id = _effective_user_id(ident, is_admin, body)
-    if not user_id:
-        return JSONResponse({"error": "Could not resolve user_id", "code": "bad_request"}, status_code=400)
-
-    try:
-        steps = await run_preflight(
-            repo=repo, ref=ref, user_id=user_id,
-            instance_id=ident.instance_id if ident else None,
-        )
-        result = format_json(repo=repo, ref=ref, steps=steps)
-        result["markdown"] = format_markdown(repo=repo, ref=ref, steps=steps)
-        return JSONResponse(result)
-    except Exception as e:
-        logger.exception("preflight error: %s", e)
-        return JSONResponse({"success": False, "error": str(e), "code": "internal_error"}, status_code=500)
+    if verify_admin_key(request):
+        return True
+    if extract_identity(request):
+        return True
+    return False
 
 
 @router.post("/dispatch")
 async def prbot_dispatch(request: Request):
-    """Dispatch a GitHub Actions workflow to create a pull request."""
+    """Dispatch a GitHub Actions workflow to create a pull request.
+
+    Auth: admin key (bridge) or JWT (direct). Perimeter only — no user_id needed.
+    Credentials (github_token, api_key) come from the body or X-Dependency-Tokens.
+    """
     from ..services.dispatch import dispatch_workspace
 
-    ident, is_admin = _resolve_identity(request)
-    if not ident:
+    if not _require_perimeter(request):
         return JSONResponse(
             {"error": "Unauthorized", "code": "unauthorized"}, status_code=401,
         )
@@ -128,15 +82,28 @@ async def prbot_dispatch(request: Request):
             status_code=400,
         )
 
-    ref = body.get("ref", "main")
-    user_id = _effective_user_id(ident, is_admin, body)
-    if not user_id:
-        return JSONResponse({"error": "Could not resolve user_id", "code": "bad_request"}, status_code=400)
+    base_branch = body.get("base_branch", "main")
+    branch_name = body.get("branch_name") or None
+
+    dep_tokens = extract_dependency_tokens(request)
+    github_token = body.get("github_token") or dep_tokens.get("github_rest")
+    api_key = body.get("api_key") or dep_tokens.get("agent_key")
+
+    if not github_token:
+        return JSONResponse(
+            {"error": "Bad credentials — missing github_token.", "code": "unauthorized"},
+            status_code=401,
+        )
+    if not api_key:
+        return JSONResponse(
+            {"error": "Bad credentials — missing api_key.", "code": "unauthorized"},
+            status_code=401,
+        )
 
     try:
         status, result = await dispatch_workspace(
-            repo=repo, ref=ref, task_context=task_context,
-            user_id=user_id, instance_id=ident.instance_id if ident else None,
+            repo=repo, base_branch=base_branch, task_context=task_context,
+            github_token=github_token, api_key=api_key, branch_name=branch_name,
         )
         return JSONResponse(result, status_code=status)
     except Exception as e:
@@ -146,27 +113,155 @@ async def prbot_dispatch(request: Request):
 
 @router.post("/callback")
 async def prbot_callback(request: Request):
-    """Accept completion callback from a workflow run. Placeholder — logs and ACKs."""
-    ident, is_admin = _resolve_identity(request)
-    if not ident:
-        return JSONResponse({"error": "Unauthorized", "code": "unauthorized"}, status_code=401)
+    """Accept run report from a completed workflow run.
+
+    Called by the final workflow step (if: always) with the full run context:
+    agent output, step results, PR metadata, errors.
+    Validates the one-time report_token, then merges results into the
+    existing dispatched record in MongoDB.
+    """
+    from ..database.run_reports import complete_run_report
 
     try:
         body = await request.json()
     except Exception:
         return JSONResponse({"error": "Invalid JSON body", "code": "bad_request"}, status_code=400)
 
-    logger.info("callback received: %s", body)
-    return JSONResponse({"success": True, "status": "ack"})
+    report_token = body.get("report_token", "").strip()
+    if not report_token:
+        return JSONResponse(
+            {"error": "Missing report_token", "code": "unauthorized"},
+            status_code=401,
+        )
+
+    if not body.get("repo") or not body.get("run_id"):
+        return JSONResponse(
+            {"error": "Missing required fields: repo, run_id", "code": "bad_request"},
+            status_code=400,
+        )
+
+    updated = await complete_run_report(report_token=report_token, report_data=body)
+    if not updated:
+        return JSONResponse(
+            {"error": "Invalid or expired report_token", "code": "unauthorized"},
+            status_code=401,
+        )
+
+    logger.info(
+        "callback: run report completed for %s run_id=%s status=%s",
+        body.get("repo"), body.get("run_id"), body.get("status"),
+    )
+    return JSONResponse({"success": True})
+
+
+@router.get("/runs")
+async def prbot_list_runs(request: Request):
+    """List recent run reports for a repo.
+
+    Auth: admin key or JWT (perimeter). No user_id needed — the repo
+    itself is the scoping key.
+    """
+    from ..database.run_reports import get_run_reports
+
+    if not _require_perimeter(request):
+        return JSONResponse({"error": "Unauthorized", "code": "unauthorized"}, status_code=401)
+
+    repo = request.query_params.get("repo", "").strip()
+    if not repo:
+        return JSONResponse({"error": "Missing query param: repo", "code": "bad_request"}, status_code=400)
+
+    limit = min(int(request.query_params.get("limit", "20")), 100)
+    skip = int(request.query_params.get("skip", "0"))
+
+    reports = await get_run_reports(repo=repo, limit=limit, skip=skip)
+    return JSONResponse({"repo": repo, "count": len(reports), "reports": reports}, default=str)
+
+
+@router.get("/runs/{identifier}")
+async def prbot_get_run(request: Request, identifier: str):
+    """Get run status + metadata by dispatch_id or GitHub Actions run_id.
+
+    Auth: admin key or JWT (perimeter).
+    Returns a log summary (availability, line count, preview) — use
+    GET /runs/{id}/logs for actual log lines.
+    """
+    from ..database.run_reports import get_run_report
+
+    if not _require_perimeter(request):
+        return JSONResponse({"error": "Unauthorized", "code": "unauthorized"}, status_code=401)
+
+    report = await get_run_report(identifier)
+    if not report:
+        return JSONResponse({"error": "Run not found", "code": "not_found"}, status_code=404)
+
+    report["logs"] = _build_log_summary(report)
+
+    return JSONResponse(report, default=str)
+
+
+@router.get("/runs/{identifier}/logs")
+async def prbot_get_run_logs(request: Request, identifier: str):
+    """Retrieve paginated log lines for a run.
+
+    Three retrieval modes:
+      - all=true: every line in one response (for archival / programmatic use)
+      - page=N: specific page of lines (1-indexed)
+      - page=-1: last page only (quick tail check)
+
+    Auth: admin key or JWT (perimeter).
+    """
+    from ..database.run_reports import get_run_log_lines
+
+    if not _require_perimeter(request):
+        return JSONResponse({"error": "Unauthorized", "code": "unauthorized"}, status_code=401)
+
+    all_lines = request.query_params.get("all", "").lower() in ("true", "1")
+    page = int(request.query_params.get("page", "1"))
+    page_size = min(int(request.query_params.get("page_size", "100")), 500)
+
+    result = await get_run_log_lines(
+        identifier=identifier,
+        page=page,
+        page_size=page_size,
+        all_lines=all_lines,
+    )
+    if result is None:
+        return JSONResponse({"error": "Run not found or no logs available", "code": "not_found"}, status_code=404)
+
+    return JSONResponse(result, default=str)
+
+
+def _build_log_summary(report: dict) -> dict:
+    """Build the logs summary block for a run status response.
+
+    Uses log_line_count from the DB record (log_lines themselves are
+    excluded by the summary projection).
+    """
+    line_count = report.pop("log_line_count", 0) or 0
+    truncated = report.pop("log_truncated", False)
+    default_page_size = 100
+    total_pages = -(-line_count // default_page_size) if line_count > 0 else 0
+
+    return {
+        "available": line_count > 0,
+        "total_lines": line_count,
+        "total_pages": total_pages,
+        "truncated": truncated,
+    }
 
 
 @router.get("/install-link")
 async def prbot_install_link(request: Request):
-    """Return a GitHub App install URL with state=user_id embedded."""
-    ident = authenticate_jwt(request)
+    """Return a GitHub App install URL with state=user_id embedded.
+
+    Auth: JWT required — this is the one route that actually needs user_id
+    because we embed it in the GitHub install state param.
+    """
+    ident = extract_identity(request)
     if not ident:
         return JSONResponse(
-            {"error": "Unauthorized - JWT required", "code": "unauthorized"},
+            {"error": "Unauthorized — JWT required (need user_id for install state)",
+             "code": "unauthorized"},
             status_code=401,
         )
 
@@ -213,36 +308,6 @@ async def prbot_install_callback(request: Request):
 
     return_url = f"{_RETURN_URL}?installation_linked=1&installation_id={installation_id}"
     return RedirectResponse(url=return_url, status_code=302)
-
-
-@router.get("/job-secrets")
-async def prbot_job_secrets(request: Request):
-    """Exchange a single-use job token for the user's LLM API key.
-
-    Called from inside the GitHub Actions workflow. No JWT auth — the
-    token IS the credential.
-    """
-    from ..database.job_tokens import consume_job_token
-
-    token = request.query_params.get("token", "").strip()
-    repo = request.query_params.get("repo", "").strip()
-
-    if not token or not repo:
-        return JSONResponse(
-            {"error": "Missing token or repo", "code": "bad_request"},
-            status_code=400,
-        )
-
-    api_key = await consume_job_token(token=token, repo=repo)
-    if not api_key:
-        logger.warning("job-secrets: invalid/expired/consumed token for repo=%s", repo)
-        return JSONResponse(
-            {"error": "Invalid, expired, or already-used token", "code": "unauthorized"},
-            status_code=401,
-        )
-
-    logger.info("job-secrets: issued ANTHROPIC_API_KEY for repo=%s", repo)
-    return JSONResponse({"ANTHROPIC_API_KEY": api_key})
 
 
 @router.post("/webhook")

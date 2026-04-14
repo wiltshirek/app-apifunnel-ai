@@ -8,9 +8,7 @@ import { join } from 'path';
 
 import { connectDB } from './lib/db';
 import { subagentsRouter } from './routes/subagents';
-import { scheduledTasksRouter } from './routes/scheduled-tasks';
 import { notificationsRouter } from './routes/notifications';
-import { internalRouter } from './routes/internal';
 
 const app = new Hono();
 
@@ -38,9 +36,7 @@ app.get('/v1/openapi.yaml', (c) => {
 
 // ── Routes ──────────────────────────────────────────────────────────────────
 app.route('/v1/subagents', subagentsRouter);
-app.route('/v1/scheduled-tasks', scheduledTasksRouter);
 app.route('/v1/notifications', notificationsRouter);
-app.route('/v1/internal', internalRouter);
 
 // ── 404 fallthrough ─────────────────────────────────────────────────────────
 app.notFound((c) => c.json({ error: 'Not found' }, 404));

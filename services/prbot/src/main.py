@@ -32,6 +32,8 @@ logger = logging.getLogger(__name__)
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     await get_db()
+    from .database.run_reports import ensure_indexes
+    await ensure_indexes()
     logger.info("PR Bot API started")
     yield
     await close_db()

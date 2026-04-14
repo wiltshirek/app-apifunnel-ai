@@ -1,5 +1,4 @@
 import { connectDB } from '../db';
-import { ScheduledTask } from '../../models/ScheduledTask';
 import { SubagentTask } from '../../models/SubagentTask';
 import { ingestLearning } from './client';
 
@@ -70,16 +69,14 @@ export function validateRunLearnings(payload: Partial<RunLearningsPayload>): str
 }
 
 export async function recordRunLearnings(params: {
-  auth: { sub: string; scheduled_task_id?: string; subagent_task_id?: string };
+  auth: { sub: string; subagent_task_id?: string };
   payload: RunLearningsPayload;
-  scheduledTaskId?: string;
   subagentTaskId?: string;
   finalStatus?: 'done' | 'failed';
   skipGraphiti?: boolean;
-}): Promise<{ dirtyTriggered: boolean }> {
+}): Promise<void> {
   const { auth, payload, finalStatus, skipGraphiti } = params;
   const subagentTaskId = params.subagentTaskId ?? auth.subagent_task_id ?? payload.subagent_task_id;
-  const scheduledTaskId = params.scheduledTaskId ?? auth.scheduled_task_id ?? payload.scheduled_task_id;
 
   await connectDB();
 
@@ -88,40 +85,7 @@ export async function recordRunLearnings(params: {
     subagentTask = await SubagentTask.findOne({ task_id: subagentTaskId, user_id: auth.sub });
   }
 
-  let scheduledTask: any = null;
-  if (scheduledTaskId) {
-    scheduledTask = await ScheduledTask.findOne({
-      scheduled_task_id: scheduledTaskId,
-      user_id: auth.sub,
-      deleted_at: { $exists: false },
-    });
-  }
-
   const recommendedServers = Array.isArray(payload.recommended_api_servers) ? payload.recommended_api_servers : [];
-  let dirtyTriggered = false;
-
-  if (scheduledTask && recommendedServers.length > 0) {
-    const approvedSet = new Set<string>(scheduledTask.required_api_servers ?? []);
-    const newServers = recommendedServers.filter((r: any) => !approvedSet.has(r.api_server));
-
-    if (newServers.length > 0) {
-      dirtyTriggered = true;
-      const pendingRecs = newServers.map((r: any) => ({
-        api_server: r.api_server,
-        reason: r.reason,
-        recommended_at: new Date(),
-        source_run_id: subagentTaskId,
-      }));
-
-      await ScheduledTask.findOneAndUpdate(
-        { scheduled_task_id: scheduledTaskId, user_id: auth.sub },
-        {
-          $set: { api_server_set_status: 'dirty', blocked_reason: 'pending_api_approval' },
-          $push: { pending_api_server_recommendations: { $each: pendingRecs } },
-        }
-      );
-    }
-  }
 
   if (subagentTask) {
     await SubagentTask.findOneAndUpdate(
@@ -141,19 +105,17 @@ export async function recordRunLearnings(params: {
     );
   }
 
-  if (skipGraphiti) return { dirtyTriggered };
+  if (skipGraphiti) return;
 
   const completedAt = subagentTask?.completed_at ?? new Date();
-  const promptText = subagentTask
-    ? (scheduledTask?.prompt ?? subagentTask.label ?? '')
-    : (payload.prompt_text ?? '');
+  const promptText = subagentTask?.label ?? (payload.prompt_text ?? '');
   const ingestStatus = finalStatus ?? (subagentTask?.status === 'done' ? 'done' : 'failed');
 
   ingestLearning({
     groupId: `learning_${auth.sub}`,
     promptText,
-    requiredApiServers: scheduledTask?.required_api_servers ?? [],
-    scheduledTaskId,
+    requiredApiServers: [],
+    scheduledTaskId: undefined,
     subagentTaskId,
     personaId: subagentTask?.persona_id,
     status: ingestStatus,
@@ -164,7 +126,7 @@ export async function recordRunLearnings(params: {
     turnsUsed: subagentTask?.turns_used,
     tokensTotal: subagentTask?.tokens?.total,
     errorCount: subagentTask?.error_count,
-    apiServerSetStatus: dirtyTriggered ? 'dirty' : (scheduledTask?.api_server_set_status ?? 'clean'),
+    apiServerSetStatus: 'clean',
     apiServersUsed: payload.api_servers_used ?? [],
     errorsEncountered: payload.errors_encountered ?? [],
     apiServerObservations: payload.api_server_observations ?? [],
@@ -175,6 +137,4 @@ export async function recordRunLearnings(params: {
     preloadTaskPatternId: subagentTask?.preload_task_pattern_id,
     preloadEfficiencyHintId: subagentTask?.preload_efficiency_hint_id,
   });
-
-  return { dirtyTriggered };
 }
