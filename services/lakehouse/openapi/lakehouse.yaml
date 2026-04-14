@@ -550,6 +550,169 @@ paths:
         '404':
           description: Not found
 
+  /api/v1/assets/{asset_id}/bytes:
+    get:
+      operationId: get_asset_bytes_external
+      summary: Get raw asset bytes (base64)
+      description: Returns base64-encoded raw file bytes as JSON. Useful for PyMuPDF/Pillow processing in code containers.
+      security:
+        - BearerAuth: []
+        - AdminKey: []
+      parameters:
+        - name: asset_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Asset ID
+      responses:
+        '200':
+          description: Raw bytes (base64-encoded)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asset_id:
+                    type: string
+                  content_type:
+                    type: string
+                  size_bytes:
+                    type: integer
+                  base64:
+                    type: string
+                    description: Base64-encoded raw file bytes
+        '401':
+          description: Unauthorized
+        '404':
+          description: Asset not found
+
+  /api/v1/assets/{asset_id}/text:
+    get:
+      operationId: get_asset_text_external
+      summary: Get extracted text content
+      description: |
+        Format-agnostic text extraction. Returns a JSON object — access the content via result['text'].
+        PDFs: text field contains all extracted text concatenated across all pages.
+        Text files (CSV, JSON, Markdown, plain text, HTML, XML, YAML, etc.): text field contains raw content.
+        Binary/visual files (images, DXF/DWG): returns 400 directing to get_asset_view.
+        No truncation — the full text is always returned.
+      security:
+        - BearerAuth: []
+        - AdminKey: []
+      parameters:
+        - name: asset_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Asset ID
+      responses:
+        '200':
+          description: Full text content of the asset
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asset_id:
+                    type: string
+                  filename:
+                    type: string
+                  content_type:
+                    type: string
+                  text:
+                    type: string
+                    description: Full text content of the asset
+                  char_count:
+                    type: integer
+                    description: Character count of the returned text
+        '400':
+          description: Text extraction not supported for this content type
+        '401':
+          description: Unauthorized
+        '404':
+          description: Asset not found
+
+  /api/v1/assets/{asset_id}/view:
+    get:
+      operationId: get_asset_view_external
+      summary: Get asset content for vision models
+      description: |
+        Returns rendered page images for visual content (PDFs, CAD files, images).
+        For PDFs, returns individual pages as base64-encoded PNG images.
+        For DXF/DWG CAD files, renders to PNG.
+        For other file types, returns the raw bytes as base64.
+      security:
+        - BearerAuth: []
+        - AdminKey: []
+      parameters:
+        - name: asset_id
+          in: path
+          required: true
+          schema:
+            type: string
+          description: Asset ID
+        - name: format
+          in: query
+          schema:
+            type: string
+            enum: [pdf, pages, auto]
+            default: auto
+          description: Output format (auto selects best format for the content type)
+        - name: max_pages
+          in: query
+          schema:
+            type: integer
+            default: 5
+          description: Maximum number of pages to return for multi-page documents
+      responses:
+        '200':
+          description: Asset content for vision analysis
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asset_id:
+                    type: string
+                  filename:
+                    type: string
+                  content_type:
+                    type: string
+                  format:
+                    type: string
+                  total_pages:
+                    type: integer
+                  page_count:
+                    type: integer
+                  pages:
+                    type: array
+                    description: Rendered page images (for PDFs and CAD files)
+                    items:
+                      type: object
+                      properties:
+                        page:
+                          type: integer
+                        page_num:
+                          type: integer
+                        base64:
+                          type: string
+                        width:
+                          type: integer
+                        height:
+                          type: integer
+                  base64:
+                    type: string
+                    description: Base64-encoded raw bytes (fallback for non-renderable types)
+                  size_bytes:
+                    type: integer
+                    description: Size in bytes (present when returning raw base64 fallback)
+        '401':
+          description: Unauthorized
+        '404':
+          description: Asset not found
+
   /health:
     get:
       operationId: health_check
