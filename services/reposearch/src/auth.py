@@ -1,8 +1,10 @@
 """Authentication helpers for the repo search service.
 
-Three header concerns:
-    Authorization: Bearer <REPO_SEARCH_ADMIN_KEY>   — endpoint protection
-    X-User-Token: <JWT>                              — user identity (decoded, not verified)
+Auth patterns (both accepted):
+    1. Admin key:  Authorization: Bearer <admin_key>, X-User-Token: <JWT>
+    2. Direct JWT: Authorization: Bearer <JWT>
+
+Dependency tokens:
     X-Dependency-Tokens: {"github_rest": "gho_..."}  — forwarded GitHub OAuth token
 """
 
@@ -55,14 +57,7 @@ def verify_admin_key(request: Request) -> bool:
     return token == expected
 
 
-def get_identity(request: Request) -> Optional[Identity]:
-    """Extract user identity from X-User-Token header (JWT, decoded without verification)."""
-    user_token = request.headers.get("x-user-token") or ""
-    if not user_token:
-        return None
-    claims = _decode_jwt_payload(user_token)
-    if not claims:
-        return None
+def _identity_from_claims(claims: dict) -> Optional[Identity]:
     user_id = claims.get("sub") or claims.get("user_id")
     if not user_id:
         return None
@@ -72,6 +67,37 @@ def get_identity(request: Request) -> Optional[Identity]:
         instance_id=claims.get("instance_id"),
         email=claims.get("email"),
     )
+
+
+def authenticate_internal(request: Request) -> Optional[Identity]:
+    """Dual-auth: admin key + X-User-Token, else fall through to direct JWT."""
+    if verify_admin_key(request):
+        user_token = request.headers.get("x-user-token") or ""
+        claims = _decode_jwt_payload(user_token)
+        if claims:
+            ident = _identity_from_claims(claims)
+            if ident:
+                ident.is_admin = True
+                return ident
+        return None
+
+    return authenticate_jwt(request)
+
+
+def authenticate_jwt(request: Request) -> Optional[Identity]:
+    """Authenticate via Bearer JWT in Authorization header."""
+    auth = request.headers.get("authorization") or ""
+    if not auth.startswith("Bearer "):
+        return None
+    claims = _decode_jwt_payload(auth[7:])
+    if not claims:
+        return None
+    return _identity_from_claims(claims)
+
+
+def get_identity(request: Request) -> Optional[Identity]:
+    """Extract user identity from either auth pattern."""
+    return authenticate_internal(request)
 
 
 def get_github_token(request: Request) -> Optional[str]:
@@ -87,10 +113,12 @@ def get_github_token(request: Request) -> Optional[str]:
 
 
 def require_admin(request: Request) -> Optional[JSONResponse]:
-    """Return an error response if the admin key is invalid, or None if OK."""
-    if not verify_admin_key(request):
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    return None
+    """Return an error response if neither admin key nor valid JWT is present."""
+    if verify_admin_key(request):
+        return None
+    if authenticate_jwt(request):
+        return None
+    return JSONResponse({"error": "Unauthorized"}, status_code=401)
 
 
 def require_github_token(request: Request) -> tuple[Optional[str], Optional[JSONResponse]]:
