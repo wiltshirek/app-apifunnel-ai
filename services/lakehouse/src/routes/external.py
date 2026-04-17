@@ -1,9 +1,13 @@
 """Asset routes (/api/v1/assets/*).
 
-Single unified namespace. Auth via _resolve_auth handles all callers:
-  - Bearer JWT (client UI / direct)
-  - Bearer <MCP_ADMIN_KEY> + X-User-Token (bridge/MCP)
-  - Bearer <MCP_ADMIN_KEY> alone (unscoped admin tooling)
+Auth contract (enforced by `require_identity` on every handler):
+
+    1. X-Admin-Key present and matches MCP_ADMIN_KEY?   → continue. else 401.
+    2. Authorization: Bearer <jwt> present?             → decode. else 400.
+    3. Decoded payload has `sub`?                       → caller.user_id = payload.sub. else 400.
+    4. Every data operation scopes by that user_id. Always.
+
+Admin key is a perimeter lock. It does not confer identity or grant unscoped access.
 """
 
 import base64
@@ -17,13 +21,16 @@ from pathlib import Path as _Path
 from fastapi import APIRouter, File, Form, Request, UploadFile
 from fastapi.responses import JSONResponse, PlainTextResponse, Response
 
-from ..auth import authenticate_jwt, verify_admin_key, Identity, _decode_jwt_payload, _identity_from_claims
+from ..auth import require_identity
 from ..db import get_db
 from ..services.assets import (
+    create_code_script_asset,
     delete_asset,
+    delete_session_ephemerals,
     detect_content_type,
     get_asset,
     list_assets,
+    persist_session_artifact,
     promote_session_artifact,
     search_assets,
     update_asset,
@@ -53,42 +60,17 @@ async def openapi_spec():
     return PlainTextResponse("spec not found", status_code=404)
 
 
-def _resolve_auth(request: Request) -> tuple[Optional[Identity], bool]:
-    """Return (identity, is_admin).
-
-    Admin key + X-User-Token → scoped identity with is_admin=True (bridge/MCP calls).
-    Admin key alone → identity=None, is_admin=True (unscoped admin tooling).
-    Bearer JWT → user identity, is_admin=False.
-    """
-    if verify_admin_key(request):
-        user_token = request.headers.get("x-user-token") or ""
-        if user_token:
-            claims = _decode_jwt_payload(user_token)
-            if claims:
-                ident = _identity_from_claims(claims)
-                if ident:
-                    ident.is_admin = True
-                    return ident, True
-        return None, True
-    ident = authenticate_jwt(request)
-    return ident, False
-
-
 @router.get("")
 async def api_list(request: Request):
-    ident, is_admin = _resolve_auth(request)
-    if not ident and not is_admin:
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
-
+    ident = require_identity(request)
     db = await get_db()
     result = await list_assets(
         db,
-        user_id=ident.user_id if ident else "",
+        user_id=ident.user_id,
         content_type=request.query_params.get("content_type"),
-        tenant_id=ident.tenant_id if ident else None,
+        tenant_id=ident.tenant_id,
         limit=int(request.query_params.get("limit", "50")),
         cursor=request.query_params.get("cursor"),
-        admin_access=is_admin,
     )
 
     for asset in result.get("assets", []):
@@ -99,9 +81,7 @@ async def api_list(request: Request):
 
 @router.get("/search")
 async def api_search(request: Request):
-    ident, is_admin = _resolve_auth(request)
-    if not ident and not is_admin:
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    ident = require_identity(request)
 
     q = request.query_params.get("q")
     if not q:
@@ -110,12 +90,11 @@ async def api_search(request: Request):
     db = await get_db()
     results = await search_assets(
         db,
-        user_id=ident.user_id if ident else "",
+        user_id=ident.user_id,
         query_text=q,
         content_type=request.query_params.get("content_type"),
-        tenant_id=ident.tenant_id if ident else None,
+        tenant_id=ident.tenant_id,
         limit=min(int(request.query_params.get("limit", "20")), 100),
-        admin_access=is_admin,
     )
     return JSONResponse({"results": results})
 
@@ -123,9 +102,7 @@ async def api_search(request: Request):
 @router.post("/search")
 async def api_search_post(request: Request):
     """POST search with JSON body — used by agent/MCP callers."""
-    ident, is_admin = _resolve_auth(request)
-    if not ident and not is_admin:
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    ident = require_identity(request)
 
     body = await request.json()
     query_text = body.get("query")
@@ -135,12 +112,11 @@ async def api_search_post(request: Request):
     db = await get_db()
     results = await search_assets(
         db,
-        user_id=ident.user_id if ident else "",
+        user_id=ident.user_id,
         query_text=query_text,
         content_type=body.get("content_type"),
-        tenant_id=ident.tenant_id if ident else None,
+        tenant_id=ident.tenant_id,
         limit=min(int(body.get("limit", 20)), 100),
-        admin_access=is_admin,
     )
     return JSONResponse(results)
 
@@ -150,27 +126,21 @@ async def api_upload(
     request: Request,
     files: list[UploadFile] = File(...),
     tenant_id: Optional[str] = Form(None),
-    user_id: Optional[str] = Form(None),
 ):
-    ident, is_admin = _resolve_auth(request)
-    if not ident and not is_admin:
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    ident = require_identity(request)
 
-    effective_user = user_id if is_admin and user_id else (ident.user_id if ident else None)
-    if not effective_user:
-        return JSONResponse({"error": "user_id required for admin uploads"}, status_code=400)
-    effective_tenant = tenant_id or (ident.tenant_id if ident else None)
+    effective_tenant = tenant_id or ident.tenant_id
 
     db = await get_db()
     uploaded = []
     for f in files:
         file_bytes = await f.read()
         result = await upload_asset(
-            db, file_bytes, _sanitize_filename(f.filename or "untitled"), effective_user,
+            db, file_bytes, _sanitize_filename(f.filename or "untitled"), ident.user_id,
             tenant_id=effective_tenant,
-            subagent_task_id=ident.subagent_task_id if ident else None,
-            scheduled_task_id=ident.scheduled_task_id if ident else None,
-            client_meta=ident.client_meta if ident else None,
+            subagent_task_id=ident.subagent_task_id,
+            scheduled_task_id=ident.scheduled_task_id,
+            client_meta=ident.client_meta,
         )
         uploaded.append(result)
 
@@ -179,9 +149,7 @@ async def api_upload(
 
 @router.post("/ingest")
 async def api_ingest(request: Request):
-    ident, is_admin = _resolve_auth(request)
-    if not ident and not is_admin:
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    ident = require_identity(request)
 
     body = await request.json()
     filename = body.get("filename")
@@ -194,37 +162,110 @@ async def api_ingest(request: Request):
     except Exception:
         return JSONResponse({"error": "Invalid base64_content"}, status_code=400)
 
-    effective_user = body.get("user_id") if is_admin else (ident.user_id if ident else None)
-    if not effective_user:
-        return JSONResponse({"error": "user_id required for admin ingest"}, status_code=400)
-    effective_tenant = body.get("tenant_id") or (ident.tenant_id if ident else None)
-
-    subagent_task_id = None
-    scheduled_task_id = None
-    client_meta = None
-    if ident:
-        subagent_task_id = ident.subagent_task_id
-        scheduled_task_id = ident.scheduled_task_id
-        client_meta = ident.client_meta
+    effective_tenant = body.get("tenant_id") or ident.tenant_id
 
     db = await get_db()
     result = await upload_asset(
-        db, file_bytes, _sanitize_filename(filename), effective_user,
+        db, file_bytes, _sanitize_filename(filename), ident.user_id,
         tenant_id=effective_tenant,
-        subagent_task_id=subagent_task_id,
-        scheduled_task_id=scheduled_task_id,
-        client_meta=client_meta,
+        subagent_task_id=ident.subagent_task_id,
+        scheduled_task_id=ident.scheduled_task_id,
+        client_meta=ident.client_meta,
     )
     if result.get("error"):
         return JSONResponse(result, status_code=500)
     return JSONResponse(result)
 
 
+@router.post("/session-artifact")
+async def api_session_artifact(
+    request: Request,
+    file: UploadFile = File(...),
+    session_id: str = Form(...),
+    artifact_path: str = Form(...),
+    artifact_type: Optional[str] = Form(None),
+    source: Optional[str] = Form(None),
+    is_ephemeral: bool = Form(False),
+    container_id: Optional[str] = Form(None),
+    tenant_id: Optional[str] = Form(None),
+):
+    """Upsert a code-execution session artifact.
+
+    Keyed on (user_id, session_id, artifact_path). Repeated writes to the same
+    path within the same session overwrite the existing asset_id and s3_key.
+    """
+    ident = require_identity(request)
+
+    file_bytes = await file.read()
+    result = await persist_session_artifact(
+        await get_db(),
+        user_id=ident.user_id,
+        session_id=session_id,
+        artifact_path=artifact_path,
+        file_bytes=file_bytes,
+        artifact_type=artifact_type,
+        source=source,
+        is_ephemeral=is_ephemeral,
+        container_id=container_id,
+        tenant_id=tenant_id or ident.tenant_id,
+        subagent_task_id=ident.subagent_task_id,
+        scheduled_task_id=ident.scheduled_task_id,
+        client_meta=ident.client_meta,
+    )
+    if result.get("error"):
+        return JSONResponse(result, status_code=400 if "required" in result["error"] else 500)
+    return JSONResponse(result)
+
+
+@router.post("/code-script")
+async def api_code_script(request: Request):
+    """Store a code-execution script as an asset with rolling FIFO cap per user."""
+    ident = require_identity(request)
+
+    body = await request.json()
+    code = body.get("code")
+    filename = body.get("filename")
+    if code is None or not filename:
+        return JSONResponse({"error": "Missing 'code' or 'filename'"}, status_code=400)
+
+    result = await create_code_script_asset(
+        await get_db(),
+        user_id=ident.user_id,
+        code=str(code),
+        filename=_sanitize_filename(filename),
+        tenant_id=ident.tenant_id,
+        client_meta=ident.client_meta,
+    )
+    if result.get("error"):
+        return JSONResponse(result, status_code=500)
+    return JSONResponse(result)
+
+
+@router.delete("/session/{session_id}")
+async def api_delete_session(session_id: str, request: Request):
+    """Bulk-delete ephemeral artifacts for {caller, session_id}.
+
+    ?keep_outputs=true preserves artifact_path beginning with user_outputs/ or drafts/.
+    """
+    ident = require_identity(request)
+
+    keep_outputs_raw = request.query_params.get("keep_outputs", "false").lower()
+    keep_outputs = keep_outputs_raw in ("1", "true", "yes")
+
+    result = await delete_session_ephemerals(
+        await get_db(),
+        user_id=ident.user_id,
+        session_id=session_id,
+        keep_outputs=keep_outputs,
+    )
+    if result.get("error"):
+        return JSONResponse(result, status_code=400)
+    return JSONResponse(result)
+
+
 @router.put("/{asset_id}")
 async def api_update(asset_id: str, request: Request):
-    ident, is_admin = _resolve_auth(request)
-    if not ident and not is_admin:
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    ident = require_identity(request)
 
     body = await request.json()
     b64 = body.get("base64_content")
@@ -236,18 +277,14 @@ async def api_update(asset_id: str, request: Request):
     except Exception:
         return JSONResponse({"error": "Invalid base64_content"}, status_code=400)
 
-    effective_user = body.get("user_id") if is_admin else (ident.user_id if ident else None)
-    if not effective_user and not is_admin:
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
-    effective_tenant = body.get("tenant_id") or (ident.tenant_id if ident else None)
+    effective_tenant = body.get("tenant_id") or ident.tenant_id
 
     db = await get_db()
     result = await update_asset(
         db, asset_id, file_bytes,
-        user_id=effective_user or "",
+        user_id=ident.user_id,
         filename=body.get("filename"),
         tenant_id=effective_tenant,
-        admin_access=is_admin,
     )
     if result is None:
         return JSONResponse({"error": "Asset not found"}, status_code=404)
@@ -258,18 +295,15 @@ async def api_update(asset_id: str, request: Request):
 
 @router.get("/{asset_id}")
 async def api_get(asset_id: str, request: Request):
-    ident, is_admin = _resolve_auth(request)
-    if not ident and not is_admin:
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    ident = require_identity(request)
 
     include_page_text = request.query_params.get("include_page_text", "false").lower() == "true"
 
     db = await get_db()
     asset = await get_asset(
         db, asset_id,
-        user_id=ident.user_id if ident else "",
-        tenant_id=ident.tenant_id if ident else None,
-        admin_access=is_admin,
+        user_id=ident.user_id,
+        tenant_id=ident.tenant_id,
     )
     if not asset:
         return JSONResponse({"error": "Asset not found"}, status_code=404)
@@ -291,16 +325,10 @@ async def api_get(asset_id: str, request: Request):
 
 @router.get("/{asset_id}/download")
 async def api_download(asset_id: str, request: Request):
-    ident, is_admin = _resolve_auth(request)
-    if not ident and not is_admin:
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    ident = require_identity(request)
 
     db = await get_db()
-    asset = await get_asset(
-        db, asset_id,
-        user_id=ident.user_id if ident else "",
-        admin_access=is_admin,
-    )
+    asset = await get_asset(db, asset_id, user_id=ident.user_id)
     if not asset:
         return JSONResponse({"error": "Asset not found"}, status_code=404)
 
@@ -323,16 +351,13 @@ async def api_download(asset_id: str, request: Request):
 
 @router.post("/{asset_id}/promote")
 async def api_promote(asset_id: str, request: Request):
-    ident, is_admin = _resolve_auth(request)
-    if not ident and not is_admin:
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    ident = require_identity(request)
 
     db = await get_db()
     promoted = await promote_session_artifact(
         db, asset_id,
-        user_id=ident.user_id if ident else None,
-        tenant_id=ident.tenant_id if ident else None,
-        admin_access=is_admin,
+        user_id=ident.user_id,
+        tenant_id=ident.tenant_id,
     )
     if not promoted:
         return JSONResponse({"error": "Asset not found or already promoted"}, status_code=404)
@@ -342,16 +367,13 @@ async def api_promote(asset_id: str, request: Request):
 
 @router.get("/{asset_id}/view")
 async def api_view(asset_id: str, request: Request):
-    ident, is_admin = _resolve_auth(request)
-    if not ident and not is_admin:
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    ident = require_identity(request)
 
     db = await get_db()
     asset = await get_asset(
         db, asset_id,
-        user_id=ident.user_id if ident else "",
-        tenant_id=ident.tenant_id if ident else None,
-        admin_access=is_admin,
+        user_id=ident.user_id,
+        tenant_id=ident.tenant_id,
     )
     if not asset:
         return JSONResponse({"error": "Asset not found"}, status_code=404)
@@ -466,16 +488,13 @@ async def api_view(asset_id: str, request: Request):
 
 @router.get("/{asset_id}/bytes")
 async def api_bytes(asset_id: str, request: Request):
-    ident, is_admin = _resolve_auth(request)
-    if not ident and not is_admin:
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    ident = require_identity(request)
 
     db = await get_db()
     asset = await get_asset(
         db, asset_id,
-        user_id=ident.user_id if ident else "",
-        tenant_id=ident.tenant_id if ident else None,
-        admin_access=is_admin,
+        user_id=ident.user_id,
+        tenant_id=ident.tenant_id,
     )
     if not asset:
         return JSONResponse({"error": "Asset not found"}, status_code=404)
@@ -498,16 +517,13 @@ async def api_bytes(asset_id: str, request: Request):
 
 @router.get("/{asset_id}/text")
 async def api_text(asset_id: str, request: Request):
-    ident, is_admin = _resolve_auth(request)
-    if not ident and not is_admin:
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    ident = require_identity(request)
 
     db = await get_db()
     asset = await get_asset(
         db, asset_id,
-        user_id=ident.user_id if ident else "",
-        tenant_id=ident.tenant_id if ident else None,
-        admin_access=is_admin,
+        user_id=ident.user_id,
+        tenant_id=ident.tenant_id,
     )
     if not asset:
         return JSONResponse({"error": "Asset not found"}, status_code=404)
@@ -527,16 +543,10 @@ async def api_text(asset_id: str, request: Request):
 
 @router.delete("/{asset_id}")
 async def api_delete(asset_id: str, request: Request):
-    ident, is_admin = _resolve_auth(request)
-    if not ident and not is_admin:
-        return JSONResponse({"error": "Unauthorized"}, status_code=401)
+    ident = require_identity(request)
 
     db = await get_db()
-    deleted = await delete_asset(
-        db, asset_id,
-        user_id=ident.user_id if ident else "",
-        admin_access=is_admin,
-    )
+    deleted = await delete_asset(db, asset_id, user_id=ident.user_id)
     if not deleted:
         return JSONResponse({"error": "Asset not found"}, status_code=404)
     return JSONResponse({"asset_id": asset_id, "deleted": True})

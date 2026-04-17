@@ -219,12 +219,10 @@ async def upload_asset(
     return resp
 
 
-async def get_asset(db, asset_id: str, user_id: str, tenant_id: Optional[str] = None, admin_access: bool = False) -> Optional[Dict[str, Any]]:
-    query: Dict[str, Any] = {"_id": asset_id}
-    if not admin_access:
-        if not user_id:
-            return None
-        query["user_id"] = user_id
+async def get_asset(db, asset_id: str, user_id: str, tenant_id: Optional[str] = None) -> Optional[Dict[str, Any]]:
+    if not user_id:
+        return None
+    query: Dict[str, Any] = {"_id": asset_id, "user_id": user_id}
     if tenant_id:
         query["tenant_id"] = tenant_id
 
@@ -241,17 +239,15 @@ async def list_assets(
     tenant_id: Optional[str] = None,
     limit: int = 50,
     cursor: Optional[str] = None,
-    admin_access: bool = False,
     tags: Optional[str] = None,
 ) -> Dict[str, Any]:
     from ..storage.s3 import get_presigned_url
 
+    if not user_id:
+        return {"assets": [], "next_cursor": None, "has_more": False}
+
     limit = max(1, limit)
-    query: Dict[str, Any] = {}
-    if not admin_access:
-        if not user_id:
-            return {"assets": [], "next_cursor": None, "has_more": False}
-        query["user_id"] = user_id
+    query: Dict[str, Any] = {"user_id": user_id}
     if content_type:
         query["content_type"] = content_type
     if tenant_id:
@@ -313,14 +309,11 @@ async def search_assets(
     content_type: Optional[str] = None,
     tenant_id: Optional[str] = None,
     limit: int = 20,
-    admin_access: bool = False,
 ) -> List[Dict[str, Any]]:
+    if not user_id:
+        return []
     limit = min(limit, 100)
-    match: Dict[str, Any] = {"$text": {"$search": query_text}}
-    if not admin_access:
-        if not user_id:
-            return []
-        match["user_id"] = user_id
+    match: Dict[str, Any] = {"$text": {"$search": query_text}, "user_id": user_id}
     if content_type:
         match["content_type"] = content_type
     if tenant_id:
@@ -367,16 +360,13 @@ async def update_asset(
     user_id: str,
     filename: Optional[str] = None,
     tenant_id: Optional[str] = None,
-    admin_access: bool = False,
 ) -> Optional[Dict[str, Any]]:
     """Replace an asset's stored bytes in-place, preserving all provenance metadata."""
     from ..storage.s3 import upload_file, get_presigned_url
 
-    query: Dict[str, Any] = {"_id": asset_id}
-    if not admin_access:
-        if not user_id:
-            return None
-        query["user_id"] = user_id
+    if not user_id:
+        return None
+    query: Dict[str, Any] = {"_id": asset_id, "user_id": user_id}
     if tenant_id:
         query["tenant_id"] = tenant_id
 
@@ -473,16 +463,13 @@ async def update_asset(
 async def promote_session_artifact(
     db,
     asset_id: str,
-    user_id: Optional[str] = None,
+    user_id: str,
     tenant_id: Optional[str] = None,
-    admin_access: bool = False,
 ) -> bool:
     """Remove ephemeral session metadata from an asset, making it permanent."""
-    query: Dict[str, Any] = {"_id": asset_id}
-    if not admin_access:
-        if not user_id:
-            return False
-        query["user_id"] = user_id
+    if not user_id:
+        return False
+    query: Dict[str, Any] = {"_id": asset_id, "user_id": user_id}
     if tenant_id:
         query["tenant_id"] = tenant_id
 
@@ -496,14 +483,12 @@ async def promote_session_artifact(
     return result.matched_count > 0
 
 
-async def delete_asset(db, asset_id: str, user_id: str, admin_access: bool = False) -> bool:
+async def delete_asset(db, asset_id: str, user_id: str) -> bool:
     from ..storage.s3 import delete_file
 
-    query: Dict[str, Any] = {"_id": asset_id}
-    if not admin_access:
-        if not user_id:
-            return False
-        query["user_id"] = user_id
+    if not user_id:
+        return False
+    query: Dict[str, Any] = {"_id": asset_id, "user_id": user_id}
 
     asset = await db.assets.find_one(query)
     if not asset:
@@ -515,3 +500,238 @@ async def delete_asset(db, asset_id: str, user_id: str, admin_access: bool = Fal
 
     result = await db.assets.delete_one(query)
     return result.deleted_count > 0
+
+
+# ---------------------------------------------------------------------------
+# Write endpoints for code-execution sessions (retires bridge's direct Mongo/S3)
+# ---------------------------------------------------------------------------
+
+CODE_SCRIPT_CAP_PER_USER = 5
+
+
+async def persist_session_artifact(
+    db,
+    user_id: str,
+    session_id: str,
+    artifact_path: str,
+    file_bytes: bytes,
+    artifact_type: Optional[str] = None,
+    source: Optional[str] = None,
+    is_ephemeral: bool = False,
+    container_id: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+    subagent_task_id: Optional[str] = None,
+    scheduled_task_id: Optional[str] = None,
+    client_meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Upsert an asset produced inside a code-execution session.
+
+    Keyed on (user_id, session_id, artifact_path): repeated writes to the same
+    path within the same session overwrite rather than accumulate. The S3 object
+    is stored at `artifacts/{user_id}/{session_id}/{artifact_path}`.
+    """
+    from ..storage.s3 import upload_file
+
+    if not user_id or not session_id or not artifact_path:
+        return {"error": "user_id, session_id, and artifact_path are required"}
+
+    filename = artifact_path.rsplit("/", 1)[-1] or artifact_path
+    content_type = await detect_content_type(file_bytes, filename)
+    checksum = hashlib.sha256(file_bytes).hexdigest()
+    s3_key = f"artifacts/{user_id}/{session_id}/{artifact_path}"
+
+    ok = await upload_file(
+        io.BytesIO(file_bytes), s3_key, content_type,
+        {"user_id": user_id, "session_id": session_id, "artifact_path": artifact_path},
+    )
+    if not ok:
+        return {"error": "S3 upload failed"}
+
+    now = datetime.utcnow()
+    upsert_filter = {"user_id": user_id, "session_id": session_id, "artifact_path": artifact_path}
+
+    existing = await db.assets.find_one(upsert_filter, {"_id": 1, "created_at": 1})
+    asset_id = existing["_id"] if existing else _generate_asset_id()
+    created_at = existing["created_at"] if existing else now
+
+    doc: Dict[str, Any] = {
+        "_id": asset_id,
+        "user_id": user_id,
+        "session_id": session_id,
+        "artifact_path": artifact_path,
+        "filename": filename,
+        "content_type": content_type,
+        "size_bytes": len(file_bytes),
+        "checksum_sha256": checksum,
+        "s3_key": s3_key,
+        "is_ephemeral": bool(is_ephemeral),
+        "processing_status": "complete",
+        "created_at": created_at,
+        "updated_at": now,
+    }
+    if artifact_type:
+        doc["artifact_type"] = artifact_type
+    if source:
+        doc["source"] = source
+    if container_id:
+        doc["container_id"] = container_id
+    if tenant_id:
+        doc["tenant_id"] = tenant_id
+    if subagent_task_id:
+        doc["subagent_task_id"] = subagent_task_id
+    if scheduled_task_id:
+        doc["scheduled_task_id"] = scheduled_task_id
+    if client_meta:
+        doc["client_meta"] = client_meta
+
+    await db.assets.replace_one({"_id": asset_id}, doc, upsert=True)
+
+    return {
+        "asset_id": asset_id,
+        "user_id": user_id,
+        "session_id": session_id,
+        "artifact_path": artifact_path,
+        "filename": filename,
+        "content_type": content_type,
+        "size_bytes": len(file_bytes),
+        "checksum_sha256": checksum,
+        "s3_key": s3_key,
+        "is_ephemeral": bool(is_ephemeral),
+        "artifact_type": artifact_type,
+        "source": source,
+        "created_at": created_at.isoformat(),
+        "updated_at": now.isoformat(),
+    }
+
+
+async def create_code_script_asset(
+    db,
+    user_id: str,
+    code: str,
+    filename: str,
+    tenant_id: Optional[str] = None,
+    client_meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Store a code-execution script as an asset tagged `code_script`.
+
+    Enforces a rolling FIFO cap per user: after insertion, any `code_script`
+    assets beyond the newest {CODE_SCRIPT_CAP_PER_USER} are evicted (both Mongo
+    doc and S3 object).
+    """
+    from ..storage.s3 import delete_file, upload_file
+
+    if not user_id:
+        return {"error": "user_id required"}
+
+    safe_name = filename or "script.py"
+    file_bytes = code.encode("utf-8")
+    content_type = await detect_content_type(file_bytes, safe_name)
+    asset_id = _generate_asset_id()
+    ext = safe_name.rsplit(".", 1)[-1].lower() if "." in safe_name else "py"
+    s3_key = f"{user_id}/{asset_id}/original.{ext}"
+    checksum = hashlib.sha256(file_bytes).hexdigest()
+
+    ok = await upload_file(
+        io.BytesIO(file_bytes), s3_key, content_type,
+        {"asset_id": asset_id, "user_id": user_id, "kind": "code_script"},
+    )
+    if not ok:
+        return {"error": "S3 upload failed", "asset_id": asset_id}
+
+    now = datetime.utcnow()
+    doc: Dict[str, Any] = {
+        "_id": asset_id,
+        "user_id": user_id,
+        "tenant_id": tenant_id,
+        "filename": safe_name,
+        "content_type": content_type,
+        "size_bytes": len(file_bytes),
+        "checksum_sha256": checksum,
+        "s3_key": s3_key,
+        "extracted_text": code,
+        "tags": ["code_script"],
+        "source": "code_execution_script",
+        "processing_status": "complete",
+        "created_at": now,
+        "updated_at": now,
+    }
+    if client_meta:
+        doc["client_meta"] = client_meta
+
+    await db.assets.insert_one(doc)
+
+    # FIFO eviction: keep only the newest CODE_SCRIPT_CAP_PER_USER code_script assets.
+    cursor = db.assets.find(
+        {"user_id": user_id, "tags": "code_script"},
+        {"_id": 1, "s3_key": 1},
+    ).sort("created_at", -1).skip(CODE_SCRIPT_CAP_PER_USER)
+    evicted: List[str] = []
+    async for stale in cursor:
+        stale_key = stale.get("s3_key")
+        if stale_key:
+            try:
+                await delete_file(stale_key)
+            except Exception as exc:
+                logger.warning("FIFO evict: S3 delete failed for %s: %s", stale_key, exc)
+        await db.assets.delete_one({"_id": stale["_id"]})
+        evicted.append(stale["_id"])
+
+    return {
+        "asset_id": asset_id,
+        "filename": safe_name,
+        "content_type": content_type,
+        "size_bytes": len(file_bytes),
+        "checksum_sha256": checksum,
+        "s3_key": s3_key,
+        "tags": ["code_script"],
+        "source": "code_execution_script",
+        "created_at": now.isoformat(),
+        "evicted_asset_ids": evicted,
+    }
+
+
+async def delete_session_ephemerals(
+    db,
+    user_id: str,
+    session_id: str,
+    keep_outputs: bool = False,
+) -> Dict[str, Any]:
+    """Bulk-delete ephemeral session artifacts.
+
+    Deletes every doc where {user_id, session_id, is_ephemeral=true}. When
+    `keep_outputs` is true, artifacts whose `artifact_path` begins with
+    `user_outputs/` or `drafts/` are preserved (they represent user-visible
+    deliverables, not transient session state).
+    """
+    from ..storage.s3 import delete_file
+
+    if not user_id or not session_id:
+        return {"deleted_count": 0, "deleted_asset_ids": [], "error": "user_id and session_id required"}
+
+    query: Dict[str, Any] = {
+        "user_id": user_id,
+        "session_id": session_id,
+        "is_ephemeral": True,
+    }
+    if keep_outputs:
+        query["artifact_path"] = {"$not": {"$regex": r"^(user_outputs/|drafts/)"}}
+
+    cursor = db.assets.find(query, {"_id": 1, "s3_key": 1})
+    targets: List[Dict[str, Any]] = [d async for d in cursor]
+
+    for t in targets:
+        s3_key = t.get("s3_key")
+        if s3_key:
+            try:
+                await delete_file(s3_key)
+            except Exception as exc:
+                logger.warning("ephemeral delete: S3 delete failed for %s: %s", s3_key, exc)
+
+    if targets:
+        await db.assets.delete_many({"_id": {"$in": [t["_id"] for t in targets]}})
+
+    return {
+        "deleted_count": len(targets),
+        "deleted_asset_ids": [t["_id"] for t in targets],
+        "keep_outputs": bool(keep_outputs),
+    }

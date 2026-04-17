@@ -499,6 +499,169 @@ paths:
         '401':
           description: Unauthorized
 
+  /api/v1/assets/session-artifact:
+    post:
+      operationId: persist_session_artifact
+      summary: Upsert a code-execution session artifact
+      description: |
+        Upsert an asset produced inside a code-execution session. Keyed on
+        `(user_id, session_id, artifact_path)` — repeated writes to the same
+        path within the same session overwrite rather than accumulate.
+        The S3 object is stored at `artifacts/{user_id}/{session_id}/{artifact_path}`.
+        Retires the bridge's direct-Mongo `persist_session_artifacts` path.
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              required:
+                - file
+                - session_id
+                - artifact_path
+              properties:
+                file:
+                  type: string
+                  format: binary
+                session_id:
+                  type: string
+                artifact_path:
+                  type: string
+                  description: Relative path within the session workspace, e.g. "user_outputs/report.csv"
+                artifact_type:
+                  type: string
+                  description: Optional, e.g. "output", "input"
+                source:
+                  type: string
+                  description: Optional, e.g. "code_execution_output"
+                is_ephemeral:
+                  type: boolean
+                  default: false
+                container_id:
+                  type: string
+                tenant_id:
+                  type: string
+      responses:
+        '200':
+          description: Upsert result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asset_id: { type: string }
+                  user_id: { type: string }
+                  session_id: { type: string }
+                  artifact_path: { type: string }
+                  filename: { type: string }
+                  content_type: { type: string }
+                  size_bytes: { type: integer }
+                  checksum_sha256: { type: string }
+                  s3_key: { type: string }
+                  is_ephemeral: { type: boolean }
+                  created_at: { type: string, format: date-time }
+                  updated_at: { type: string, format: date-time }
+        '400':
+          description: Missing user_id, session_id, or artifact_path
+        '401':
+          description: Unauthorized
+        '500':
+          description: S3 upload failed
+
+  /api/v1/assets/code-script:
+    post:
+      operationId: create_code_script_asset
+      summary: Store a code-execution script as an asset (with FIFO cap)
+      description: |
+        Store a Python/script body as an asset tagged `code_script` with
+        `source: "code_execution_script"`. Enforces a rolling FIFO cap per user:
+        after insertion, any `code_script` assets beyond the newest 5 are
+        evicted (both Mongo doc and S3 object). Retires the bridge's direct-Mongo
+        `create_code_asset` path.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - code
+                - filename
+              properties:
+                code:
+                  type: string
+                  description: The script source code
+                filename:
+                  type: string
+                  description: Display filename for the script (e.g. "session.py")
+      responses:
+        '200':
+          description: Script asset created
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asset_id: { type: string }
+                  filename: { type: string }
+                  content_type: { type: string }
+                  size_bytes: { type: integer }
+                  checksum_sha256: { type: string }
+                  s3_key: { type: string }
+                  tags:
+                    type: array
+                    items: { type: string }
+                  source: { type: string }
+                  created_at: { type: string, format: date-time }
+                  evicted_asset_ids:
+                    type: array
+                    items: { type: string }
+                    description: asset_ids evicted by the FIFO cap on this write
+        '400':
+          description: Missing code or filename
+        '401':
+          description: Unauthorized
+
+  /api/v1/assets/session/{session_id}:
+    delete:
+      operationId: delete_session_ephemerals
+      summary: Bulk-delete ephemeral artifacts for a session
+      description: |
+        Delete every asset where `user_id` is the caller, `session_id` matches,
+        and `is_ephemeral: true`. When `keep_outputs=true`, artifacts whose
+        `artifact_path` begins with `user_outputs/` or `drafts/` are preserved
+        (they represent user-visible deliverables, not transient session state).
+        Retires the bridge's direct-Mongo `delete_ephemeral_artifacts_only` path.
+      parameters:
+        - name: session_id
+          in: path
+          required: true
+          schema:
+            type: string
+        - name: keep_outputs
+          in: query
+          schema:
+            type: boolean
+            default: false
+          description: Preserve artifact_paths under user_outputs/ or drafts/
+      responses:
+        '200':
+          description: Bulk-delete result
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  deleted_count: { type: integer }
+                  deleted_asset_ids:
+                    type: array
+                    items: { type: string }
+                  keep_outputs: { type: boolean }
+        '400':
+          description: Missing user_id or session_id
+        '401':
+          description: Unauthorized
+
   /api/v1/assets/{asset_id}:
     get:
       operationId: get_asset_external
