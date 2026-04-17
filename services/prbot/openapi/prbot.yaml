@@ -10,7 +10,9 @@ info:
     or X-Dependency-Tokens header.
 
     Single unified route namespace: all endpoints are under /api/v1/prbot/*.
-    Auth accepts Bearer JWT (client UI) or Bearer MCP_ADMIN_KEY + X-User-Token (internal).
+
+    Auth: Authorization: Bearer <user JWT> (required) and, for service-to-service
+    callers, X-Admin-Key: <MCP_ADMIN_KEY> (optional).
 
     Run lifecycle: dispatched → queued → in_progress → completed | failed | timed_out | cancelled.
     Use dispatch_id (returned from /dispatch) to poll status and fetch logs.
@@ -762,8 +764,18 @@ components:
       scheme: bearer
       bearerFormat: JWT
       description: |
-        Bearer JWT for client UI calls.
-        Or Bearer MCP_ADMIN_KEY with X-User-Token header for internal calls.
+        User JWT. Required on every authenticated route.
+        Carries `sub` (user_id), `email`, and other identity claims.
+    AdminKey:
+      type: apiKey
+      in: header
+      name: X-Admin-Key
+      description: |
+        Service-to-service admin key (`MCP_ADMIN_KEY`). Optional.
+        When present alongside `BearerAuth`, grants admin-level trust on
+        top of the user JWT identity.
 
 security:
   - BearerAuth: []
+  - BearerAuth: []
+    AdminKey: []

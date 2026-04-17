@@ -21,7 +21,7 @@ You are the local assistant for this monorepo. This document is your complete ru
               │                  │                   │
               ▼                  ▼                   ▼
    ┌──────────────────┐ ┌──────────────────┐ ┌───────────┐
-   │  Orchestration   │ │    Lakehouse     │ │ Graphiti  │
+   │  Subagents   │ │    Lakehouse     │ │ Graphiti  │
    │  Node.js (Hono)  │ │  Python (FastAPI)│ │ (adapter) │
    │  :3001           │ │  :3002           │ │ :8001     │
    └──────────────────┘ └──────────────────┘ └───────────┘
@@ -29,7 +29,7 @@ You are the local assistant for this monorepo. This document is your complete ru
               ▼                  ▼
    ┌──────────────────────────────────────────┐
    │  MongoDB Atlas (same cluster)            │
-   │  ├── apifunnel (orchestration tables)    │
+   │  ├── apifunnel (subagents tables)        │
    │  └── mcp_code_execution_server (assets)  │
    └──────────────────────────────────────────┘
 ```
@@ -40,11 +40,11 @@ You are the local assistant for this monorepo. This document is your complete ru
 |--------------------------|------------- |------|
 | `/internal/assets/*`     | Lakehouse    | 3002 |
 | `/api/v1/assets/*`       | Lakehouse    | 3002 |
-| `/v1/*`                  | Orchestration| 3001 |
+| `/v1/*`                  | Subagents| 3001 |
 | `/graphiti/*`            | Graphiti     | 8001 |
-| `/health`                | Orchestration| 3001 |
+| `/health`                | Subagents| 3001 |
 | `/health/lakehouse`      | Lakehouse    | 3002 |
-| Everything else          | Orchestration| 3001 |
+| Everything else          | Subagents| 3001 |
 
 ---
 
@@ -55,8 +55,8 @@ The `.env` at the repo root already has real credentials. Verify both services s
 ### 1a. Install dependencies
 
 ```bash
-# Orchestration
-cd services/orchestration && npm install && cd ../..
+# Subagents
+cd services/subagents && npm install && cd ../..
 
 # Lakehouse (venv)
 cd services/lakehouse
@@ -73,13 +73,13 @@ cd ../..
 ```
 
 This starts:
-- Orchestration → `http://localhost:3001`
+- Subagents → `http://localhost:3001`
 - Lakehouse → `http://localhost:3002`
 
 ### 1c. Verify health
 
 ```bash
-curl -sf http://localhost:3001/health && echo " ✅ Orchestration OK"
+curl -sf http://localhost:3001/health && echo " ✅ Subagents OK"
 curl -sf http://localhost:3002/health && echo " ✅ Lakehouse OK"
 ```
 
@@ -98,7 +98,7 @@ curl -s http://localhost:3002/internal/assets/search?q=test \
   -H "X-User-Token: eyJhbGciOiJub25lIn0.eyJzdWIiOiJ0ZXN0LXVzZXIiLCJ0ZW5hbnRfaWQiOiJ0ZXN0In0."
 ```
 
-### 1e. Test orchestration endpoints
+### 1e. Test subagents endpoints
 
 ```bash
 curl -s http://localhost:3001/v1/openapi | head -c 200
@@ -237,7 +237,7 @@ through the bridge.
 - [ ] Lakehouse: `GET /api/v1/assets/{id}/download` → raw bytes
 - [ ] Lakehouse: `DELETE /api/v1/assets/{id}` → removes from S3 + MongoDB
 - [ ] Lakehouse: Internal routes work with admin key + X-User-Token
-- [ ] Orchestration: `/v1/openapi` returns YAML
+- [ ] Subagents: `/v1/openapi` returns YAML
 - [ ] PR Bot: `GET /health` on :3003 returns OK
 - [ ] PR Bot: `POST /api/v1/prbot/dispatch` without auth → 401
 - [ ] PR Bot: `POST /api/v1/prbot/dispatch` with auth + credentials → returns `dispatch_id` + dispatches workflow
@@ -449,7 +449,7 @@ db.assets.createIndex({ extracted_text: "text" })
 ### 5b. Verify production health
 
 ```bash
-curl -sf https://api.apifunnel.ai/health && echo " ✅ Orchestration OK"
+curl -sf https://api.apifunnel.ai/health && echo " ✅ Subagents OK"
 curl -sf https://api.apifunnel.ai/health/lakehouse && echo " ✅ Lakehouse OK"
 ```
 
@@ -459,7 +459,7 @@ curl -sf https://api.apifunnel.ai/health/lakehouse && echo " ✅ Lakehouse OK"
 # Lakehouse routes
 curl -s https://api.apifunnel.ai/api/v1/assets -H "Authorization: Bearer test" | head -c 200
 
-# Orchestration routes
+# Subagents routes
 curl -s https://api.apifunnel.ai/v1/openapi | head -c 200
 ```
 
@@ -481,7 +481,7 @@ api-apifunnel-ai/
 │   ├── dev.sh                # Start both services locally
 │   └── prod.sh               # PM2 build + start for production
 ├── services/
-│   ├── orchestration/        # Node.js (Hono + Mongoose)
+│   ├── subagents/            # Node.js (Hono + Mongoose)
 │   │   ├── package.json
 │   │   ├── tsconfig.json
 │   │   ├── Dockerfile
@@ -511,17 +511,17 @@ api-apifunnel-ai/
 | Variable                | Used by        | Purpose                              |
 |-------------------------|----------------|--------------------------------------|
 | `NODE_ENV`              | Both           | `development` or `production`        |
-| `MONGODB_URI`           | Orchestration  | → `apifunnel` database               |
+| `MONGODB_URI`           | Subagents  | → `apifunnel` database               |
 | `LAKEHOUSE_MONGODB_URI` | Lakehouse      | → `mcp_code_execution_server` DB     |
 | `LAKEHOUSE_DB_NAME`     | Lakehouse      | Explicit DB name (fallback default)  |
 | `MCP_ADMIN_KEY`         | Both           | Server-to-server auth                |
 | `JWT_SECRET`            | Both           | JWT decode (unsigned trust)          |
 | `HETZNER_S3_*`          | Lakehouse      | S3 storage for asset binaries        |
-| `FIREBASE_*`            | Orchestration  | Firestore notifications              |
-| `PORT`                  | Orchestration  | HTTP port (default 3001)             |
-| `APP_BASE_URL`          | Orchestration  | Frontend app URL                     |
-| `GRAPHITI_SERVICE_URL`  | Orchestration  | Learning graph service               |
-| `CRON_SECRET`           | Orchestration  | Vercel cron auth                     |
+| `FIREBASE_*`            | Subagents  | Firestore notifications              |
+| `PORT`                  | Subagents  | HTTP port (default 3001)             |
+| `APP_BASE_URL`          | Subagents  | Frontend app URL                     |
+| `GRAPHITI_SERVICE_URL`  | Subagents  | Learning graph service               |
+| `CRON_SECRET`           | Subagents  | Vercel cron auth                     |
 
 ---
 
@@ -559,7 +559,7 @@ Auth pattern (`"pattern": "lakehouse"`) means the bridge sends:
 ### PM2 commands
 ```bash
 pm2 ls                    # List all services
-pm2 logs orchestration    # Orchestration logs
+pm2 logs subagents        # Subagents logs
 pm2 logs lakehouse        # Lakehouse logs
 pm2 restart all           # Restart everything
 pm2 monit                 # Real-time monitoring

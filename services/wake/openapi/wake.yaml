@@ -1,0 +1,570 @@
+openapi: 3.1.0
+info:
+  title: Wake Service API
+  version: 1.0.0
+  description: |
+    Schedule and deliver user-turn messages into agent sessions.
+
+    Two primitives:
+
+    - **`wakeup`** — register a cron-scheduled wake. On every cron fire, the service
+      posts a message into the target agent session as a user-turn.
+    - **`resume`** — immediately post a message into an agent session, on demand.
+
+    Both primitives ultimately do the same thing: deliver a message into the target
+    session's conversation history. The agent's next turn reads it in full context.
+
+    Replaces the legacy bridge-side `hitl_api` workflow park/resume engine
+    (`create_workflow`, `park`, `hitl_respond`, `get_context`). See
+    `plans/WAKE_SERVICE.md` for the design rationale.
+
+    ## Session model (v1)
+
+    `agent_session_id` in this API is the `task_id` of a subagent task
+    (format `sa_<timestamp>_<random>`). Session ownership is enforced: the JWT's
+    `user_id` must own the target session. Cross-user targeting is rejected.
+
+    Future adapters (primary chat, always-on agents) will share this API surface
+    once their delivery paths land.
+
+    ## Delivery
+
+    Delivery posts to the Subagents service `POST /v1/subagents/{task_id}/message`
+    endpoint internally. The message becomes the next user-turn in the target
+    session's conversation thread. The message is wrapped in a fixed frame so the
+    agent can distinguish it from genuine user input:
+
+    ```
+    This is a wake-up call for a headless subagent.
+    Current time: <ISO8601 UTC>
+    Wake id: <wake_id or delivery_id>
+    Trigger: <"wakeup" | "resume">
+
+    Wake message:
+    <caller's message, verbatim>
+
+    You are not in a user conversation. Do not ask questions.
+    ```
+
+    ## Cron
+
+    Standard 5-field cron expressions, always evaluated in UTC. Minimum granularity
+    is one minute; six-field (sub-minute) crons are rejected. Missed ticks due to
+    service restart are skipped, not caught up — on recovery, `next_fire_at` is
+    advanced to the next future cron tick.
+
+    ## Authentication
+
+    Canonical platform auth shape:
+
+    ```
+    Authorization: Bearer <user JWT>       # always the principal; required
+    X-Admin-Key: <MCP_ADMIN_KEY>           # service-to-service trust; optional
+    ```
+
+    The JWT identifies the caller. `X-Admin-Key` is present when the MCP bridge
+    is calling on behalf of the user.
+
+servers:
+  - url: https://api.apifunnel.ai
+    description: Production
+  - url: http://localhost:3005
+    description: Local development
+
+security:
+  - BearerAuth: []
+  - BearerAuth: []
+    AdminKey: []
+
+tags:
+  - name: Wakes
+    description: |
+      Scheduled wake registrations (cron-driven). Create, list, inspect, cancel.
+  - name: Delivery
+    description: |
+      Immediate, on-demand delivery of a message into an agent session.
+
+paths:
+  # ── Wakes ─────────────────────────────────────────────────────────────────────
+
+  /api/v1/wake/wakeups:
+    post:
+      operationId: wakeup
+      summary: Register a cron-scheduled wake for an agent session
+      description: |
+        Creates a persistent wake registration. On every cron fire, the service
+        posts `message` into the target agent session as a user-turn, with the
+        delivery envelope described above.
+
+        The message is free-form prose — it should describe what the agent
+        should do when woken (what to check for, when to give up, when to
+        cancel). There is no structured schema beyond the string.
+
+        Returns 201 with the full wake record. `next_fire_at` is the next
+        scheduled firing time in UTC.
+
+        Continues firing until cancelled via `DELETE /api/v1/wake/wakeups/{wake_id}`.
+        If the agent never cancels, the wake keeps firing until quotas kick in.
+      tags: [Wakes]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WakeupRequest'
+            examples:
+              check_gmail_hourly:
+                summary: Every hour, check for an approver reply in Gmail
+                value:
+                  agent_session_id: "sa_1711234567_abc123"
+                  cron: "0 * * * *"
+                  message: |
+                    Check Gmail for a reply to the approval request sent to legal@acme.com.
+                    If a reply has arrived, extract the decision and continue the original task.
+                    If no reply after 48 hours from the original send, give up and notify the user.
+                  label: "gmail approval watch"
+              check_autodesk_every_5min:
+                summary: Every 5 minutes, check Autodesk job status
+                value:
+                  agent_session_id: "sa_1711234567_abc123"
+                  cron: "*/5 * * * *"
+                  message: "Check the Autodesk rendering job status. If complete, fetch the output."
+                  idempotency_key: "autodesk-job-7f3a2"
+      responses:
+        '201':
+          description: Wake registered. Cron is validated and `next_fire_at` is computed.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wakeup'
+        '400':
+          description: |
+            Invalid request — typically a malformed cron, sub-minute granularity,
+            missing message, or unknown `agent_session_id` format.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Caller does not own `agent_session_id`.
+        '409':
+          description: |
+            Duplicate `idempotency_key` for this caller — an existing wake with the
+            same key already exists. Response body contains the existing wake record
+            (this is not an error, just a no-op dedup).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wakeup'
+        '429':
+          description: Caller has reached the maximum number of active wakes.
+
+    get:
+      operationId: listWakeups
+      summary: List the caller's active wakes
+      description: |
+        Returns the caller's wakes, newest first. Filterable by status.
+        Useful for the agent to reconcile its outstanding schedules and for debugging.
+      tags: [Wakes]
+      parameters:
+        - name: status
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [active, cancelled, failed]
+          description: Filter by wake status. Omit for all.
+        - name: agent_session_id
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Limit results to wakes targeting this session.
+        - name: limit
+          in: query
+          required: false
+          schema:
+            type: integer
+            default: 50
+            minimum: 1
+            maximum: 200
+        - name: cursor
+          in: query
+          required: false
+          schema:
+            type: string
+          description: Pagination cursor — pass the `wake_id` from the previous page.
+      responses:
+        '200':
+          description: Paginated list of wakes.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ListWakeupsResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /api/v1/wake/wakeups/{wake_id}:
+    get:
+      operationId: getWakeup
+      summary: Fetch a single wake by id
+      description: |
+        Returns the full wake record including current status, `next_fire_at`,
+        `delivery_count`, and `last_error` (if any). Useful for debugging why a
+        wake has or hasn't fired.
+      tags: [Wakes]
+      parameters:
+        - $ref: '#/components/parameters/WakeId'
+      responses:
+        '200':
+          description: The wake record.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Wakeup'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Caller does not own this wake.
+        '404':
+          description: No such wake.
+
+    delete:
+      operationId: cancelWakeup
+      summary: Cancel a scheduled wake
+      description: |
+        Marks the wake as `cancelled`. No further deliveries will fire.
+        Idempotent — calling on an already-cancelled wake returns 200 with
+        `already_cancelled: true`.
+      tags: [Wakes]
+      parameters:
+        - $ref: '#/components/parameters/WakeId'
+      responses:
+        '200':
+          description: Cancelled (or was already cancelled).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CancelWakeupResponse'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Caller does not own this wake.
+        '404':
+          description: No such wake.
+
+  # ── Delivery ──────────────────────────────────────────────────────────────────
+
+  /api/v1/wake/resume:
+    post:
+      operationId: resume
+      summary: Immediately post a message to an agent session
+      description: |
+        Posts `message` into the target agent session as a user-turn, right now.
+        The agent's next turn reads it in full conversational context.
+
+        Use for any out-of-band signal that an agent needs to be informed of:
+        an external webhook fired, another agent is handing off, a UI button
+        was clicked, a scheduled system job completed.
+
+        No persistence (unlike `wakeup`). Delivery is fire-and-forget with an
+        ack in the response.
+
+        **If the target session is currently running**, delivery may be queued
+        or may return 409 — depends on the session type's adapter. For subagent
+        sessions in v1, delivery requires the session to have reached a terminal
+        state (`completed` / `failed` / `cancelled`). Callers should retry with
+        backoff if they hit 409.
+      tags: [Delivery]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ResumeRequest'
+            examples:
+              webhook_handoff:
+                summary: A webhook handler telling an agent that an approval arrived
+                value:
+                  agent_session_id: "sa_1711234567_abc123"
+                  message: |
+                    The approval request you were waiting on has been granted.
+                    Approver: jane@acme.com. Timestamp: 2026-04-17T14:30:00Z.
+                    Continue with the deployment.
+              ui_nudge:
+                summary: A UI button click nudging an agent with user input
+                value:
+                  agent_session_id: "sa_1711234567_abc123"
+                  message: "User chose option B. Proceed with option B's branch."
+                  idempotency_key: "ui-click-83f2a"
+      responses:
+        '200':
+          description: Delivered.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ResumeResponse'
+        '400':
+          description: Missing message or unknown session id format.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Caller does not own `agent_session_id`.
+        '404':
+          description: Unknown `agent_session_id`.
+        '409':
+          description: |
+            Target session is currently running and cannot receive a follow-up.
+            Retry with backoff once it reaches a terminal state.
+        '429':
+          description: Rate limit exceeded for this caller.
+
+# ── Health & spec ─────────────────────────────────────────────────────────────
+
+  /api/v1/wake/openapi.yaml:
+    get:
+      operationId: getOpenApiSpec
+      summary: OpenAPI specification for the Wake Service
+      security: []
+      tags: [Wakes]
+      responses:
+        '200':
+          description: OpenAPI 3.1 YAML
+          content:
+            application/yaml:
+              schema:
+                type: string
+
+  /health:
+    get:
+      operationId: getHealth
+      summary: Health check
+      security: []
+      tags: [Wakes]
+      responses:
+        '200':
+          description: Service healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status: { type: string, example: ok }
+                  service: { type: string, example: wake }
+
+components:
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: |
+        User JWT. Required on every authenticated route.
+        Carries `sub` (user_id), `email`, and other identity claims.
+    AdminKey:
+      type: apiKey
+      in: header
+      name: X-Admin-Key
+      description: |
+        Service-to-service admin key (`MCP_ADMIN_KEY`). Optional.
+        When present alongside `BearerAuth`, grants admin-level trust on
+        top of the user JWT identity.
+
+  parameters:
+    WakeId:
+      name: wake_id
+      in: path
+      required: true
+      description: The wake registration id (format `wk_<timestamp>_<random>`).
+      schema:
+        type: string
+      example: "wk_1711234567_xyz789"
+
+  responses:
+    Unauthorized:
+      description: Missing or invalid authentication.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+
+    # ── Requests ────────────────────────────────────────────────────────────────
+
+    WakeupRequest:
+      type: object
+      required: [agent_session_id, cron, message]
+      properties:
+        agent_session_id:
+          type: string
+          description: |
+            Target session. In v1, this is the `task_id` of a subagent task
+            (format `sa_<timestamp>_<random>`). Must be owned by the caller.
+          example: "sa_1711234567_abc123"
+        cron:
+          type: string
+          description: |
+            5-field cron expression, UTC. Minimum granularity is one minute;
+            6-field (sub-minute) crons are rejected.
+          example: "*/15 * * * *"
+        message:
+          type: string
+          description: |
+            Free-form prose delivered verbatim to the agent as a user-turn
+            on every cron fire. Describes what the agent should do when woken,
+            including when to give up and cancel itself.
+          example: "Check Gmail for an approver reply. If none after 48h, give up."
+        label:
+          type: string
+          nullable: true
+          description: Human-readable hint for list views and debugging.
+          example: "gmail approval watch"
+        idempotency_key:
+          type: string
+          nullable: true
+          description: |
+            Optional dedup key scoped to the caller. Re-submitting a `wakeup` with
+            the same `idempotency_key` returns the existing wake with HTTP 409
+            (no-op dedup) instead of creating a second one.
+
+    ResumeRequest:
+      type: object
+      required: [agent_session_id, message]
+      properties:
+        agent_session_id:
+          type: string
+          description: Target session (subagent `task_id` in v1).
+          example: "sa_1711234567_abc123"
+        message:
+          type: string
+          description: Free-form prose delivered verbatim to the agent as a user-turn.
+          example: "External webhook: approval granted. Continue."
+        idempotency_key:
+          type: string
+          nullable: true
+          description: Optional dedup key scoped to the caller to guard against retries.
+
+    # ── Responses ───────────────────────────────────────────────────────────────
+
+    Wakeup:
+      type: object
+      description: A single wake registration.
+      required: [wake_id, agent_session_id, cron, message, status, created_at]
+      properties:
+        wake_id:
+          type: string
+          description: "Format `wk_<timestamp>_<random>`."
+          example: "wk_1711234567_xyz789"
+        owner_user_id:
+          type: string
+          description: The user_id from the caller's JWT at creation time.
+        agent_session_id:
+          type: string
+          example: "sa_1711234567_abc123"
+        cron:
+          type: string
+          example: "*/15 * * * *"
+        message:
+          type: string
+        label:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [active, cancelled, failed]
+        next_fire_at:
+          type: string
+          format: date-time
+          nullable: true
+          description: Null if status is not `active`.
+        last_delivered_at:
+          type: string
+          format: date-time
+          nullable: true
+        delivery_count:
+          type: integer
+          description: Number of successful deliveries fired so far.
+        last_error:
+          type: string
+          nullable: true
+          description: |
+            Error message from the most recent failed delivery attempt. Present
+            only when status is `failed` or when intermittent failures occurred.
+        created_at:
+          type: string
+          format: date-time
+        cancelled_at:
+          type: string
+          format: date-time
+          nullable: true
+        idempotency_key:
+          type: string
+          nullable: true
+
+    ListWakeupsResponse:
+      type: object
+      required: [wakeups, has_more]
+      properties:
+        wakeups:
+          type: array
+          items:
+            $ref: '#/components/schemas/Wakeup'
+        has_more:
+          type: boolean
+        next_cursor:
+          type: string
+          nullable: true
+
+    CancelWakeupResponse:
+      type: object
+      required: [wake_id, status, already_cancelled]
+      properties:
+        wake_id:
+          type: string
+          example: "wk_1711234567_xyz789"
+        status:
+          type: string
+          enum: [cancelled]
+        already_cancelled:
+          type: boolean
+          description: True if the wake was already in `cancelled` state before this call.
+        cancelled_at:
+          type: string
+          format: date-time
+
+    ResumeResponse:
+      type: object
+      required: [delivery_id, agent_session_id, delivered, delivered_at]
+      properties:
+        delivery_id:
+          type: string
+          description: "Opaque delivery id, format `dl_<timestamp>_<random>`."
+          example: "dl_1711234890_q9w8e7"
+        agent_session_id:
+          type: string
+          example: "sa_1711234567_abc123"
+        delivered:
+          type: boolean
+          description: Always `true` on 200. False paths surface as non-2xx status codes.
+        delivered_at:
+          type: string
+          format: date-time
+
+    Error:
+      type: object
+      required: [error]
+      properties:
+        error:
+          type: string
+          description: Short error code, e.g. `invalid_cron`, `session_not_found`, `unauthorized`.
+        message:
+          type: string
+          description: Human-readable detail.
+        field:
+          type: string
+          nullable: true
+          description: If the error is about a specific request field, which one.

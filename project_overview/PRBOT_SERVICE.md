@@ -133,7 +133,7 @@ Single GitHub Actions workflow (`.github/workflows/deploy.yml`) on push to `main
 
 | Service | Port | pm2 name | Trigger path |
 |---------|------|----------|--------------|
-| orchestration | 3001 | `orchestration` | `services/orchestration/` |
+| subagents | 3001 | `subagents` | `services/subagents/` |
 | lakehouse | 3002 | `lakehouse` | `services/lakehouse/` |
 | prbot | 3003 | `prbot` | `services/prbot/` |
 | reposearch | 3004 | `reposearch` | `services/reposearch/` |
@@ -152,9 +152,9 @@ Local: `proxy/Caddyfile.dev` mounted by docker-compose. HTTP on `:3000`, same ro
 | `/api/v1/assets/*` | lakehouse :3002 |
 | `/api/v1/prbot/*` | prbot :3003 |
 | `/api/v1/repo-search/*` | reposearch :3004 |
-| `/v1/*` | orchestration :3001 |
+| `/v1/*` | subagents :3001 |
 | `/health/lakehouse` | lakehouse :3002 (rewrite → `/health`) |
 | `/health/prbot` | prbot :3003 (rewrite → `/health`) |
 | `/health/reposearch` | reposearch :3004 (rewrite → `/health`) |
-| `/health` | orchestration :3001 |
-| `*` (catch-all) | orchestration :3001 |
+| `/health` | subagents :3001 |
+| `*` (catch-all) | subagents :3001 |

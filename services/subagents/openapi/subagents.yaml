@@ -1,14 +1,13 @@
 openapi: 3.1.0
 info:
-  title: Automation & Orchestration API
+  title: Subagents API
   version: 1.0.0
   description: |
-    REST API for automation orchestration — observing background task execution
-    and inter-agent notifications.
+    REST API for subagent observability and inter-agent notifications.
 
     ## Overview
 
-    This API provides orchestrator-level access to the automation layer. It covers:
+    This API covers:
     - **Subagent observability**: Poll status, retrieve results, and send follow-up messages to dispatched agents
     - **Notifications**: Source-agnostic signal bus for inter-agent communication
 
@@ -18,11 +17,16 @@ info:
 
     ## Authentication
 
-    All endpoints require a **Bearer JWT** in the `Authorization` header. The JWT is the same
-    token used by the main web app. It contains `sub` (user ID), `email`, and `name` claims.
+    Canonical shape (used by every platform service):
 
-    For server-to-server calls (e.g., the subagent runner calling back), the caller uses the
-    user's inherited JWT or a service token with the `X-Admin-Key` header.
+    ```
+    Authorization: Bearer <user JWT>       # always the principal; required
+    X-Admin-Key: <MCP_ADMIN_KEY>           # service-to-service trust; optional
+    ```
+
+    - **Direct user calls** (browser, PAT): send `Authorization` only.
+    - **Service-to-service calls** (e.g., the MCP bridge on behalf of a user): send both
+      headers. The JWT identifies the user; `X-Admin-Key` asserts bridge trust.
 
     ## Key Concepts
 
@@ -48,8 +52,9 @@ servers:
     description: Local development
 
 security:
-  - AdminKeyAuth: []
-    BearerAuth: []
+  - BearerAuth: []
+  - BearerAuth: []
+    AdminKeyAuth: []
 
 tags:
   - name: Subagents
@@ -151,6 +156,116 @@ paths:
                 next_cursor: null
         '401':
           $ref: '#/components/responses/Unauthorized'
+
+  /subagents/headless_reasoning_action_with_tools:
+    post:
+      operationId: dispatchHeadlessReasoningActionWithTools
+      summary: Dispatch a headless ReAct subagent (async)
+      description: |
+        Async dispatch of a full headless subagent running the
+        reasoning–action-with-tools (ReAct) loop. Creates a task row, kicks off
+        the runner in the background, and returns `task_id` immediately.
+
+        Use `GET /subagents/{id}` to poll status and
+        `GET /subagents/{id}/response` to fetch the final answer once complete.
+
+        This route is the canonical dispatch path. `POST /subagents` remains
+        as a legacy alias for backwards compatibility.
+      tags: [Subagents]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DispatchSubagentRequest'
+      responses:
+        '200':
+          description: Subagent task created and running in the background.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/DispatchSubagentResponse'
+        '400':
+          description: Missing or malformed `message` field.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          description: Caller has reached the maximum number of concurrent running tasks.
+
+  /subagents/one-shot:
+    post:
+      operationId: oneShotAgent
+      summary: Embedded agent — single direct LLM call (no ReAct, no tools)
+      description: |
+        **Direct LLM primitive.** Takes a prompt (plus optional media), calls
+        the user's LLM provider directly using the `api_settings` carried in
+        their JWT, returns the completion synchronously.
+
+        This is **not** a subagent dispatch. There is no ReAct loop, no tool
+        use, no persona prompt, no conversation thread, no task row, no
+        progress stream. It is the platform equivalent of the retired
+        `hitl_api.get_agent_response` primitive.
+
+        Provider is inferred from the `model` prefix:
+          - `gpt-*`, `o1*`, `o3*`, `o4*` → OpenAI
+          - `claude-*` → Anthropic
+          - `gemini-*` → Google
+
+        The caller's JWT must carry `api_settings.<provider>.api_key` for the
+        inferred provider, or the endpoint returns 400.
+      tags: [Subagents]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/OneShotRequest'
+            examples:
+              classification:
+                summary: Quick classification call (text only)
+                value:
+                  prompt: "Classify this customer message as refund-request, complaint, or other. Respond with one word: 'refund is unacceptable, want my money back'."
+                  model: "gpt-4o-mini"
+                  max_tokens: 10
+              vision_judgment:
+                summary: Vision-based judgment with Claude
+                value:
+                  prompt: "Does this screenshot show a login form or a dashboard?"
+                  model: "claude-3-5-sonnet-latest"
+                  media:
+                    - url: "https://example.com/screenshot.png"
+                      type: "image/png"
+              anthropic_text:
+                summary: Plain text call to Anthropic
+                value:
+                  prompt: "Summarize the EU AI Act high-risk criteria in 3 bullets."
+                  model: "claude-3-5-sonnet-latest"
+                  max_tokens: 300
+      responses:
+        '200':
+          description: Completion returned.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/OneShotResponse'
+              examples:
+                openai:
+                  summary: OpenAI response
+                  value:
+                    text: "refund"
+                    tokens: { input: 42, output: 1, total: 43 }
+                    model: "gpt-4o-mini-2024-07-18"
+                    provider: "openai"
+        '400':
+          description: |
+            Missing `prompt`, missing API key for the inferred provider,
+            or unsupported model.
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '429':
+          description: Upstream provider rate limit.
+        '500':
+          description: Upstream provider or internal error.
 
   /subagents/{id}:
     get:
@@ -737,6 +852,124 @@ components:
 
   schemas:
     # ── Subagent Request Schemas ──
+
+    DispatchSubagentRequest:
+      type: object
+      required: [message]
+      description: Request body for dispatching a headless ReAct subagent.
+      properties:
+        message:
+          type: string
+          description: The initial user-turn message that kicks off the subagent's ReAct loop.
+          example: "Research the top 3 Salesforce Enterprise tier pricing options and summarize."
+        persona_id:
+          type: string
+          nullable: true
+          description: Persona to run the subagent as. Defaults to `cowork-enterprise`.
+          example: "cowork-enterprise"
+        max_turns:
+          type: integer
+          nullable: true
+          minimum: 1
+          maximum: 50
+          description: Cap on reasoning turns. Defaults to 30, hard-capped at 50.
+        label:
+          type: string
+          nullable: true
+          description: Short human-readable label for dashboards. Defaults to the first 60 chars of `message`.
+        execution_mode:
+          type: string
+          nullable: true
+          description: Advanced — passed through to the runner.
+
+    DispatchSubagentResponse:
+      type: object
+      required: [task_id, status, thread_id]
+      properties:
+        task_id:
+          type: string
+          example: "sa_1711234567_abc123"
+        thread_id:
+          type: string
+          example: "thread_1711234567_abc123"
+        status:
+          type: string
+          enum: [running]
+        message:
+          type: string
+          example: "Task started. I'll notify you when it's done."
+        label:
+          type: string
+
+    OneShotRequest:
+      type: object
+      required: [prompt]
+      description: |
+        Request body for the embedded-agent one-shot endpoint. A direct LLM call —
+        no ReAct, no tools, no threads.
+      properties:
+        prompt:
+          type: string
+          description: The text the LLM should respond to.
+          example: "Classify this as refund or complaint: 'my order never arrived'."
+        model:
+          type: string
+          nullable: true
+          description: |
+            LLM model id. Provider is inferred from the prefix
+            (`gpt-*`/`o1*`/`o3*`/`o4*` → OpenAI, `claude-*` → Anthropic,
+            `gemini-*` → Google). Defaults to `gpt-4o-mini`.
+          example: "gpt-4o-mini"
+        media:
+          type: array
+          nullable: true
+          description: Optional media attachments (images for vision-capable models).
+          items:
+            type: object
+            required: [url, type]
+            properties:
+              url:
+                type: string
+                description: Publicly-reachable URL of the media file.
+                example: "https://example.com/screenshot.png"
+              type:
+                type: string
+                description: MIME type. Must start with `image/` for vision calls in v1.
+                example: "image/png"
+        temperature:
+          type: number
+          nullable: true
+          minimum: 0
+          maximum: 2
+          description: Sampling temperature. Omit for provider default.
+        max_tokens:
+          type: integer
+          nullable: true
+          minimum: 1
+          description: Maximum output tokens. Omit for provider default (required by Anthropic — defaults to 1024 there).
+
+    OneShotResponse:
+      type: object
+      required: [text, tokens, model, provider]
+      description: Response from the one-shot embedded-agent endpoint.
+      properties:
+        text:
+          type: string
+          description: The LLM's response text.
+        tokens:
+          type: object
+          required: [input, output, total]
+          properties:
+            input:  { type: integer }
+            output: { type: integer }
+            total:  { type: integer }
+        model:
+          type: string
+          description: The exact model identifier the provider reported.
+          example: "gpt-4o-mini-2024-07-18"
+        provider:
+          type: string
+          enum: [openai, anthropic, google]
 
     SendMessageRequest:
       type: object

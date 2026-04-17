@@ -1,7 +1,7 @@
 {
   "name": "api-apifunnel-ai",
   "version": "1.0.0",
-  "description": "APIFunnel Orchestration REST API — subagents, scheduled tasks, notifications",
+  "description": "APIFunnel Subagents REST API — subagent observability, follow-up messaging, and inter-agent notifications",
   "main": "dist/index.js",
   "scripts": {
     "dev": "tsx watch src/index.ts",

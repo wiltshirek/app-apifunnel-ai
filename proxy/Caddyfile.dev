@@ -27,7 +27,7 @@
         reverse_proxy localhost:3004
     }
 
-    # ── Orchestration (Node :3001) ────────────────────────────────
+    # ── Subagents (Node :3001) ────────────────────────────────────
     handle /v1/* {
         reverse_proxy localhost:3001
     }
@@ -55,7 +55,7 @@
         reverse_proxy localhost:3004
     }
 
-    # ── Catch-all → orchestration ─────────────────────────────────
+    # ── Catch-all → subagents (historical default for bare paths) ─
     handle {
         reverse_proxy localhost:3001
     }

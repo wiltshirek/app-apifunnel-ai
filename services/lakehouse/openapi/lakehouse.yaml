@@ -557,7 +557,8 @@ paths:
       description: Returns base64-encoded raw file bytes as JSON. Useful for PyMuPDF/Pillow processing in code containers.
       security:
         - BearerAuth: []
-        - AdminKey: []
+        - BearerAuth: []
+          AdminKey: []
       parameters:
         - name: asset_id
           in: path
@@ -599,7 +600,8 @@ paths:
         No truncation — the full text is always returned.
       security:
         - BearerAuth: []
-        - AdminKey: []
+        - BearerAuth: []
+          AdminKey: []
       parameters:
         - name: asset_id
           in: path
@@ -645,7 +647,8 @@ paths:
         For other file types, returns the raw bytes as base64.
       security:
         - BearerAuth: []
-        - AdminKey: []
+        - BearerAuth: []
+          AdminKey: []
       parameters:
         - name: asset_id
           in: path
@@ -739,11 +742,19 @@ components:
       type: http
       scheme: bearer
       bearerFormat: JWT
-      description: JWT token for external routes
+      description: |
+        User JWT. Required on every authenticated route.
+        Carries `sub` (user_id), `email`, and other identity claims.
     AdminKey:
-      type: http
-      scheme: bearer
-      description: MCP_ADMIN_KEY for internal routes (with X-User-Token header for identity)
+      type: apiKey
+      in: header
+      name: X-Admin-Key
+      description: |
+        Service-to-service admin key (`MCP_ADMIN_KEY`). Optional.
+        When present alongside `BearerAuth`, grants admin-level trust on
+        top of the user JWT identity.
 
 security:
   - BearerAuth: []
+  - BearerAuth: []
+    AdminKey: []

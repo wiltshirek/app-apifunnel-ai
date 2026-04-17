@@ -8,6 +8,7 @@ import { getAdminFirestore, firestoreConfigured } from '../lib/firebase-admin';
 import { runSubagent } from '../lib/subagent-runner';
 import { getPreload } from '../lib/learning-graph/client';
 import { generateThreadId } from '../lib/utils/schedule';
+import { oneShotCompletion, LlmError } from '../lib/llm-call';
 
 const MAX_CONCURRENT_PER_USER = 5;
 const DEFAULT_MAX_TURNS = 30;
@@ -27,8 +28,17 @@ async function getEnabledServersFromAuth(auth: any): Promise<{ enabledServers: s
 
 export const subagentsRouter = new Hono();
 
-// POST /v1/subagents — Launch a new subagent task
-subagentsRouter.post('/', async (c) => {
+/**
+ * Dispatch a headless reasoning-action-with-tools (ReAct) subagent.
+ *
+ * Async — creates the task row, fires `runSubagent` in the background, returns
+ * `task_id` immediately. Caller polls `GET /v1/subagents/{id}` for status and
+ * `GET /v1/subagents/{id}/response` for the final answer.
+ *
+ * Exposed at both `POST /v1/subagents` (legacy, kept for backwards compat)
+ * and `POST /v1/subagents/headless_reasoning_action_with_tools` (canonical).
+ */
+async function dispatchHeadlessReact(c: any) {
   await connectDB();
   const auth = authenticateInternalRequest(c.req.raw);
   if (!auth) return c.json({ error: 'Unauthorized' }, 401);
@@ -82,6 +92,53 @@ subagentsRouter.post('/', async (c) => {
   }).catch(err => console.error(`[subagents] background runSubagent error:`, err));
 
   return c.json({ task_id, status: 'running', message: "Task started. I'll notify you when it's done.", label, thread_id });
+}
+
+// POST /v1/subagents — Legacy dispatch route (kept for backwards compat)
+subagentsRouter.post('/', dispatchHeadlessReact);
+
+// POST /v1/subagents/headless_reasoning_action_with_tools — Canonical dispatch route
+subagentsRouter.post('/headless_reasoning_action_with_tools', dispatchHeadlessReact);
+
+/**
+ * POST /v1/subagents/one-shot — Embedded agent primitive.
+ *
+ * Direct single LLM call. NOT a subagent dispatch — does NOT run the ReAct
+ * loop, does NOT use `/api/chat`, does NOT create a task row, does NOT write
+ * the conversation thread. Takes a prompt (plus optional media), resolves the
+ * user's provider API key from their JWT's `api_settings`, calls the provider
+ * directly, returns structured JSON synchronously.
+ *
+ * Replaces `hitl_api.get_agent_response` from the retired bridge library.
+ */
+subagentsRouter.post('/one-shot', async (c) => {
+  const auth = authenticateInternalRequest(c.req.raw);
+  if (!auth) return c.json({ error: 'Unauthorized' }, 401);
+
+  const body = await c.req.json();
+  if (!body.prompt || typeof body.prompt !== 'string') {
+    return c.json({ error: 'A prompt is required.' }, 400);
+  }
+
+  const apiSettings = (auth as any).api_settings ?? {};
+
+  try {
+    const result = await oneShotCompletion({
+      prompt: body.prompt,
+      model: body.model,
+      media: body.media,
+      temperature: body.temperature,
+      max_tokens: body.max_tokens,
+      api_settings: apiSettings,
+    });
+    return c.json(result);
+  } catch (err: any) {
+    if (err instanceof LlmError) {
+      return c.json({ error: err.code, message: err.message }, err.status as any);
+    }
+    console.error('[one-shot] unexpected error:', err);
+    return c.json({ error: 'internal_error', message: err?.message || 'Unknown error' }, 500);
+  }
 });
 
 // GET /v1/subagents — List tasks for authenticated user

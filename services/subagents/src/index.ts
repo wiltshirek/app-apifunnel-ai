@@ -26,7 +26,7 @@ app.get('/health', (c) => c.json({ status: 'ok', ts: new Date().toISOString() })
 // ── OpenAPI spec ────────────────────────────────────────────────────────────
 app.get('/v1/openapi.yaml', (c) => {
   try {
-    const specPath = join(__dirname, '..', 'openapi', 'orchestration.yaml');
+    const specPath = join(__dirname, '..', 'openapi', 'subagents.yaml');
     c.header('Content-Type', 'application/yaml');
     return c.body(readFileSync(specPath, 'utf8'));
   } catch {

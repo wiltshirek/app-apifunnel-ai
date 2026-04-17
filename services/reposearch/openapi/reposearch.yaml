@@ -14,7 +14,9 @@ servers:
     description: Production
 
 security:
-  - AdminKey: []
+  - BearerAuth: []
+  - BearerAuth: []
+    AdminKey: []
 
 paths:
   /api/v1/repo-search/search:
@@ -136,10 +138,21 @@ paths:
 
 components:
   securitySchemes:
-    AdminKey:
+    BearerAuth:
       type: http
       scheme: bearer
-      description: REPO_SEARCH_ADMIN_KEY
+      bearerFormat: JWT
+      description: |
+        User JWT. Required on every authenticated route.
+        Carries `sub` (user_id), `email`, and other identity claims.
+    AdminKey:
+      type: apiKey
+      in: header
+      name: X-Admin-Key
+      description: |
+        Service-to-service admin key (`MCP_ADMIN_KEY`). Optional.
+        When present alongside `BearerAuth`, grants admin-level trust on
+        top of the user JWT identity.
 
   schemas:
     SearchRequest:

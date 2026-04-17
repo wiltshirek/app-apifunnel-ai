@@ -6,7 +6,7 @@ Step-by-step guide for adding a new standalone REST API service to the platform.
 
 | Existing | Port |
 |----------|------|
-| orchestration | 3001 |
+| subagents | 3001 |
 | lakehouse | 3002 |
 | prbot | 3003 |
 | reposearch | 3004 |
@@ -96,15 +96,25 @@ app = FastAPI(title="<Name> API", version="1.0.0")
 
 ### Auth Pattern
 
-Three headers from the bridge:
+Canonical shape — every service accepts this:
 
 ```
-Authorization: Bearer <ADMIN_KEY>           # endpoint protection
-X-User-Token: <JWT>                         # user identity (decode, no verify)
-X-Dependency-Tokens: {"service": "token"}   # forwarded OAuth tokens
+Authorization: Bearer <user JWT>            # always the principal; required
+X-Admin-Key: <MCP_ADMIN_KEY>                # service-to-service trust; optional
+X-Dependency-Tokens: {"service": "token"}   # forwarded OAuth tokens (optional)
 ```
 
-Copy `auth.py` from reposearch or lakehouse and change the admin key env var name.
+- **Direct user calls** (browser, PAT): `Authorization` only.
+- **Service-to-service calls** (MCP bridge on behalf of user): both headers.
+  The JWT is the user identity; `X-Admin-Key` asserts caller trust.
+
+Copy `auth.py` from reposearch, prbot, or lakehouse — they all use the same
+pattern. The admin key env var is the single shared `MCP_ADMIN_KEY` (see §4).
+
+The Python services also accept a legacy shape (`Authorization: Bearer <admin>`
++ `X-User-Token: <jwt>`) during the deprecation window, with a log warning —
+see `plans/rename-and-auth-unification/AUTH_UNIFICATION.md`. New services
+should not implement the legacy branch.
 
 ### OpenAPI Spec
 
@@ -116,9 +126,13 @@ All prefixed with `<NAME>_` — fully independent from other services.
 
 Required at minimum:
 ```
-<NAME>_ADMIN_KEY=           # endpoint protection
 <NAME>_MONGODB_URI=         # own database on shared Atlas cluster
 <NAME>_DB_NAME=apifunnel_<name>
+```
+
+Shared (not per-service) — already in `.env`:
+```
+MCP_ADMIN_KEY=              # single platform admin key; read by every service
 ```
 
 If using S3:
@@ -133,11 +147,12 @@ If using S3:
 ### Setting Secrets
 
 ```bash
-# Generate an admin key
-python3 -c "import secrets, base64; print(base64.b64encode(secrets.token_bytes(32)).decode())"
+# The admin key is already set platform-wide (MCP_ADMIN_KEY). No per-service
+# admin key is needed. If you need to rotate the platform-wide key:
+#   python3 -c "import secrets, base64; print(base64.b64encode(secrets.token_bytes(32)).decode())"
+#   gh secret set MCP_ADMIN_KEY --body "<generated-key>"
 
-# Set GitHub Actions secrets
-gh secret set <NAME>_ADMIN_KEY --body "<generated-key>"
+# Set GitHub Actions secrets for the new service's data plane
 gh secret set <NAME>_MONGODB_URI --body "mongodb+srv://.../<db_name>?retryWrites=true&w=majority"
 # ... etc
 
@@ -243,9 +258,9 @@ Four changes:
 
 - **Own database** — separate `<NAME>_DB_NAME`, never share collections with other services
 - **Own S3 bucket** — separate `<NAME>_S3_BUCKET`, own credentials when possible
-- **Own admin key** — separate `<NAME>_ADMIN_KEY`
-- **Own env prefix** — all env vars prefixed with `<NAME>_`
-- **Zero imports** from other services' code
+- **Shared admin key** — every service reads the single platform-wide `MCP_ADMIN_KEY`
+- **Own env prefix** — all service-specific env vars prefixed with `<NAME>_`
+- **Zero imports** from other services' code (copy `auth.py` instead)
 
 ## 7. Deploy
 

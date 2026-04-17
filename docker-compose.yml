@@ -1,6 +1,6 @@
 services:
-  orchestration:
-    build: services/orchestration
+  subagents:
+    build: services/subagents
     ports:
       - "3001:3001"
     env_file: .env
@@ -37,7 +37,7 @@ services:
     volumes:
       - ./proxy/Caddyfile.dev:/etc/caddy/Caddyfile:ro
     depends_on:
-      - orchestration
+      - subagents
       - lakehouse
       - prbot
       - reposearch

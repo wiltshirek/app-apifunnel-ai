@@ -9,7 +9,7 @@ jobs:
   detect-changes:
     runs-on: ubuntu-latest
     outputs:
-      orchestration: ${{ steps.check.outputs.orchestration }}
+      subagents: ${{ steps.check.outputs.subagents }}
       lakehouse: ${{ steps.check.outputs.lakehouse }}
       prbot: ${{ steps.check.outputs.prbot }}
       reposearch: ${{ steps.check.outputs.reposearch }}
@@ -26,11 +26,11 @@ jobs:
 
           if [ "$EVENT" = "workflow_dispatch" ] || [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
             echo "⚡ Full deploy (manual trigger or first push)"
-            echo "orchestration=true" >> $GITHUB_OUTPUT
-            echo "lakehouse=true"     >> $GITHUB_OUTPUT
-            echo "prbot=true"         >> $GITHUB_OUTPUT
-            echo "reposearch=true"    >> $GITHUB_OUTPUT
-            echo "proxy=true"         >> $GITHUB_OUTPUT
+            echo "subagents=true"   >> $GITHUB_OUTPUT
+            echo "lakehouse=true"   >> $GITHUB_OUTPUT
+            echo "prbot=true"       >> $GITHUB_OUTPUT
+            echo "reposearch=true"  >> $GITHUB_OUTPUT
+            echo "proxy=true"       >> $GITHUB_OUTPUT
             exit 0
           fi
 
@@ -39,24 +39,24 @@ jobs:
           echo "$CHANGED"
 
           if echo "$CHANGED" | grep -q "FORCE_ALL"; then
-            echo "orchestration=true" >> $GITHUB_OUTPUT
-            echo "lakehouse=true"     >> $GITHUB_OUTPUT
-            echo "prbot=true"         >> $GITHUB_OUTPUT
-            echo "reposearch=true"    >> $GITHUB_OUTPUT
-            echo "proxy=true"         >> $GITHUB_OUTPUT
+            echo "subagents=true"   >> $GITHUB_OUTPUT
+            echo "lakehouse=true"   >> $GITHUB_OUTPUT
+            echo "prbot=true"       >> $GITHUB_OUTPUT
+            echo "reposearch=true"  >> $GITHUB_OUTPUT
+            echo "proxy=true"       >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          echo "orchestration=$(echo "$CHANGED" | grep -qE '^services/orchestration/' && echo true || echo false)" >> $GITHUB_OUTPUT
-          echo "lakehouse=$(echo "$CHANGED" | grep -qE '^services/lakehouse/' && echo true || echo false)"         >> $GITHUB_OUTPUT
-          echo "prbot=$(echo "$CHANGED" | grep -qE '^services/prbot/' && echo true || echo false)"                 >> $GITHUB_OUTPUT
-          echo "reposearch=$(echo "$CHANGED" | grep -qE '^services/reposearch/' && echo true || echo false)"       >> $GITHUB_OUTPUT
-          echo "proxy=$(echo "$CHANGED" | grep -qE '^proxy/' && echo true || echo false)"                           >> $GITHUB_OUTPUT
+          echo "subagents=$(echo "$CHANGED" | grep -qE '^services/subagents/' && echo true || echo false)"     >> $GITHUB_OUTPUT
+          echo "lakehouse=$(echo "$CHANGED" | grep -qE '^services/lakehouse/' && echo true || echo false)"     >> $GITHUB_OUTPUT
+          echo "prbot=$(echo "$CHANGED" | grep -qE '^services/prbot/' && echo true || echo false)"             >> $GITHUB_OUTPUT
+          echo "reposearch=$(echo "$CHANGED" | grep -qE '^services/reposearch/' && echo true || echo false)"   >> $GITHUB_OUTPUT
+          echo "proxy=$(echo "$CHANGED" | grep -qE '^proxy/' && echo true || echo false)"                       >> $GITHUB_OUTPUT
 
   deploy:
     needs: detect-changes
     if: >
-      needs.detect-changes.outputs.orchestration == 'true' ||
+      needs.detect-changes.outputs.subagents == 'true' ||
       needs.detect-changes.outputs.lakehouse == 'true' ||
       needs.detect-changes.outputs.prbot == 'true' ||
       needs.detect-changes.outputs.reposearch == 'true' ||
@@ -135,21 +135,25 @@ jobs:
 
           echo "✅ .env written"
 
-      - name: Deploy orchestration
-        if: needs.detect-changes.outputs.orchestration == 'true'
+      - name: Deploy subagents
+        if: needs.detect-changes.outputs.subagents == 'true'
         run: |
           SSH="ssh -i ~/.ssh/key -o StrictHostKeyChecking=no root@$NODE_IP"
           SCP="scp -i ~/.ssh/key -o StrictHostKeyChecking=no -r"
 
-          echo "📦 Syncing orchestration..."
-          $SSH "mkdir -p /opt/api-apifunnel/services/orchestration"
-          $SCP services/orchestration/package.json services/orchestration/package-lock.json services/orchestration/tsconfig.json "root@$NODE_IP:/opt/api-apifunnel/services/orchestration/"
-          $SCP services/orchestration/src "root@$NODE_IP:/opt/api-apifunnel/services/orchestration/"
-          $SCP services/orchestration/openapi "root@$NODE_IP:/opt/api-apifunnel/services/orchestration/"
+          echo "📦 Syncing subagents..."
+          $SSH "mkdir -p /opt/api-apifunnel/services/subagents"
+          $SCP services/subagents/package.json services/subagents/package-lock.json services/subagents/tsconfig.json "root@$NODE_IP:/opt/api-apifunnel/services/subagents/"
+          $SCP services/subagents/src "root@$NODE_IP:/opt/api-apifunnel/services/subagents/"
+          $SCP services/subagents/openapi "root@$NODE_IP:/opt/api-apifunnel/services/subagents/"
 
-          $SSH "cd /opt/api-apifunnel/services/orchestration && npm ci --production=false && npm run build"
-          $SSH "cd /opt/api-apifunnel && pm2 restart orchestration --update-env 2>/dev/null || pm2 start services/orchestration/dist/index.js --name orchestration --env-file .env --max-memory-restart 512M"
-          echo "✅ Orchestration deployed"
+          $SSH "cd /opt/api-apifunnel/services/subagents && npm ci --production=false && npm run build"
+          # One-shot cleanup: remove the old pm2 entry if it still exists on this node.
+          $SSH "pm2 delete orchestration 2>/dev/null || true"
+          # Remove any stale /opt/api-apifunnel/services/orchestration directory from a prior deploy.
+          $SSH "rm -rf /opt/api-apifunnel/services/orchestration 2>/dev/null || true"
+          $SSH "cd /opt/api-apifunnel && pm2 restart subagents --update-env 2>/dev/null || pm2 start services/subagents/dist/index.js --name subagents --env-file .env --max-memory-restart 512M"
+          echo "✅ Subagents deployed"
 
       - name: Deploy lakehouse
         if: needs.detect-changes.outputs.lakehouse == 'true'
@@ -216,7 +220,7 @@ jobs:
           SSH="ssh -i ~/.ssh/key -o StrictHostKeyChecking=no root@$NODE_IP"
           $SSH "pm2 save"
           sleep 5
-          $SSH "curl -sf http://localhost:3001/health && echo ' ✅ Orchestration OK' || echo ' ❌ Orchestration down'"
+          $SSH "curl -sf http://localhost:3001/health && echo ' ✅ Subagents OK' || (echo ' ❌ Subagents down' && pm2 logs subagents --nostream --lines 30 2>&1 || true)"
           $SSH "curl -sf http://localhost:3002/health && echo ' ✅ Lakehouse OK' || (echo ' ❌ Lakehouse down' && pm2 logs lakehouse --nostream --lines 30 2>&1 || true)"
           $SSH "curl -sf http://localhost:3003/health && echo ' ✅ PR Bot OK' || (echo ' ❌ PR Bot down' && pm2 logs prbot --nostream --lines 30 2>&1 || true)"
           $SSH "curl -sf http://localhost:3004/health && echo ' ✅ Repo Search OK' || (echo ' ❌ Repo Search down' && pm2 logs reposearch --nostream --lines 30 2>&1 || true)"
