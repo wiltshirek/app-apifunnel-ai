@@ -152,7 +152,7 @@ jobs:
           $SSH "pm2 delete orchestration 2>/dev/null || true"
           # Remove any stale /opt/api-apifunnel/services/orchestration directory from a prior deploy.
           $SSH "rm -rf /opt/api-apifunnel/services/orchestration 2>/dev/null || true"
-          $SSH "cd /opt/api-apifunnel && pm2 restart subagents --update-env 2>/dev/null || pm2 start services/subagents/dist/index.js --name subagents --env-file .env --max-memory-restart 512M"
+          $SSH "cd /opt/api-apifunnel && pm2 restart subagents --update-env 2>/dev/null || (set -a && source .env && set +a && pm2 start services/subagents/dist/index.js --name subagents --max-memory-restart 512M)"
           echo "✅ Subagents deployed"
 
       - name: Deploy lakehouse
