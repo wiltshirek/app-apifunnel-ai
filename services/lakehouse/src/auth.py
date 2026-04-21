@@ -1,16 +1,11 @@
-"""Authentication for the Lakehouse API.
+"""Authentication helpers — mirrors the bridge's dual-auth pattern.
 
-Contract (locked):
+Internal routes:
+    Authorization: Bearer <MCP_ADMIN_KEY>
+    X-User-Token: <user JWT>  (decoded without signature verification)
 
-    1. X-Admin-Key present and matches MCP_ADMIN_KEY?   → continue. else 401.
-    2. Authorization: Bearer <jwt> present?             → decode. else 400.
-    3. Decoded payload has `sub`?                       → caller's user_id = payload.sub. else 400.
-    4. Every data operation scopes by that user_id. Always.
-
-Admin key is a perimeter check (is the caller allowed to reach this endpoint at all?).
-It does NOT convey identity, does NOT grant unscoped access, and does NOT substitute
-for a user_id. Identity comes exclusively from the JWT `sub` claim. JWTs are decoded,
-not signature-verified — this is a trusted service-to-service relationship.
+External routes:
+    Authorization: Bearer <user JWT>
 """
 
 import base64
@@ -20,7 +15,7 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-from fastapi import HTTPException, Request
+from fastapi import Request
 
 logger = logging.getLogger(__name__)
 
@@ -33,11 +28,11 @@ class Identity:
     email: Optional[str] = None
     subagent_task_id: Optional[str] = None
     scheduled_task_id: Optional[str] = None
-    client_meta: Optional[dict] = None
+    is_admin: bool = False
 
 
 def _decode_jwt_payload(token: str) -> Optional[dict]:
-    """Base64-decode the JWT payload. No signature verification — trusted relationship."""
+    """Base64-decode the JWT payload (no signature verification)."""
     parts = token.split(".")
     if len(parts) != 3:
         return None
@@ -46,51 +41,64 @@ def _decode_jwt_payload(token: str) -> Optional[dict]:
         padding = 4 - len(payload_b64) % 4
         if padding != 4:
             payload_b64 += "=" * padding
-        return json.loads(base64.b64decode(payload_b64))
+        return json.loads(base64.urlsafe_b64decode(payload_b64))
     except Exception:
         return None
 
 
-def _admin_key_match(candidate: str) -> bool:
-    expected = os.environ.get("MCP_ADMIN_KEY")
-    if not expected or not candidate:
-        return False
-    return candidate == expected
-
-
-def require_identity(request: Request) -> Identity:
-    """Authenticate a request and return the caller's identity.
-
-    Raises HTTPException with the appropriate status per the four-line contract:
-      - 401 if X-Admin-Key is missing or does not match MCP_ADMIN_KEY.
-      - 400 if Authorization: Bearer <jwt> is absent or undecodable.
-      - 400 if the decoded payload has no `sub` claim.
-
-    On success returns an `Identity` keyed on `sub`. There is no admin mode;
-    there is no unscoped caller; every authenticated request has a user_id.
-    """
-    admin_key = request.headers.get("x-admin-key") or ""
-    if not _admin_key_match(admin_key):
-        raise HTTPException(status_code=401, detail="Unauthorized")
-
-    auth = request.headers.get("authorization") or ""
-    if not auth.startswith("Bearer "):
-        raise HTTPException(status_code=400, detail="Missing Authorization Bearer token")
-
-    claims = _decode_jwt_payload(auth[7:])
-    if not claims:
-        raise HTTPException(status_code=400, detail="Unreadable JWT")
-
-    sub = claims.get("sub")
-    if not sub:
-        raise HTTPException(status_code=400, detail="JWT missing 'sub' claim")
-
+def _identity_from_claims(claims: dict) -> Optional[Identity]:
+    user_id = claims.get("sub") or claims.get("user_id")
+    if not user_id:
+        return None
     return Identity(
-        user_id=sub,
+        user_id=user_id,
         tenant_id=claims.get("tenant_id"),
         instance_id=claims.get("instance_id"),
         email=claims.get("email"),
         subagent_task_id=claims.get("subagent_task_id"),
         scheduled_task_id=claims.get("scheduled_task_id"),
-        client_meta=claims.get("client_meta"),
     )
+
+
+def verify_admin_key(request: Request) -> bool:
+    """Check if the request carries a valid MCP_ADMIN_KEY."""
+    expected = os.environ.get("MCP_ADMIN_KEY")
+    if not expected:
+        return False
+    auth = request.headers.get("authorization") or ""
+    if not auth.startswith("Bearer "):
+        return False
+    token = auth[7:]
+    if len(token) > 100:
+        return False
+    return token == expected
+
+
+def authenticate_internal(request: Request) -> Optional[Identity]:
+    """Dual-auth for /internal/* routes.
+
+    1. Authorization: Bearer <MCP_ADMIN_KEY>  →  identity from X-User-Token
+    2. Else fall through to JWT in Authorization header
+    """
+    if verify_admin_key(request):
+        user_token = request.headers.get("x-user-token") or ""
+        claims = _decode_jwt_payload(user_token)
+        if claims:
+            ident = _identity_from_claims(claims)
+            if ident:
+                ident.is_admin = True
+                return ident
+        return None
+
+    return authenticate_jwt(request)
+
+
+def authenticate_jwt(request: Request) -> Optional[Identity]:
+    """Authenticate via Bearer JWT in Authorization header."""
+    auth = request.headers.get("authorization") or ""
+    if not auth.startswith("Bearer "):
+        return None
+    claims = _decode_jwt_payload(auth[7:])
+    if not claims:
+        return None
+    return _identity_from_claims(claims)

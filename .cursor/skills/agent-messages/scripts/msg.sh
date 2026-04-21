@@ -1,289 +1,423 @@
-#!/bin/bash
-# Agent message bus — file-based inter-project communication.
-#
-# Shared inbox lives at /tmp/agent-messages/. Any agent on this machine with
-# this skill installed can read & write here.
-#
-# Filename convention:      <recipient>:<snippet>.md
-# Broadcast recipient:      all
-# Per-recipient seen state: /tmp/agent-messages/.seen/<recipient>.txt
-#
-# Subcommands:
-#   whoami                         → prints this agent's identity (workspace dir basename)
-#   inbox [--all]                  → lists unread messages for me (or all files with --all)
-#   read <file>                    → cat a message and mark it seen
-#   peek <file>                    → cat a message without marking seen
-#   send <recipient> <snippet>     → reads body from stdin, writes a message
-#   mark-seen <file>               → mark a file as seen without reading
-#   watch [interval] [cap]         → poll inbox every <interval>s until new msg arrives
-#                                      or <cap>s elapses. interval=15, cap=1200 by default.
-#   whois                          → lists recent senders (unique recipients that have appeared)
-#   clean                          → deletes messages older than 7 days
-#
-# All identities are derived from the basename of the Cursor workspace root (i.e.
-# $PWD when this script is invoked by the agent). No per-project config needed.
+#!/usr/bin/env python3
+"""Agent message bus — append-only log model.
 
-set -euo pipefail
+Single source of truth: /tmp/agent-messages/events.log (JSONL, one record per line).
+Each record is a message. Line number is its identity (seq).
 
-MSG_DIR="/tmp/agent-messages"
-SEEN_DIR="$MSG_DIR/.seen"
+This replaces the older per-file folder model, which had no causal ordering and
+allowed concurrent senders to produce stale-state replies. In the log model:
+    - Appends are atomic (fcntl.flock LOCK_EX around write).
+    - `seq` is a strictly monotonic line number.
+    - Each agent remembers ONE integer — the last seq it has read.
+    - `in_reply_to` points to a specific prior seq; if the sender's cursor is
+      behind that seq, send is rejected (you can't reply to a message you
+      haven't read).
+    - `watch` returns every new record since the reader's cursor, not just
+      the first. No bursts are missed.
 
-_ensure_dirs() {
-    mkdir -p "$MSG_DIR" "$SEEN_DIR"
-}
+Identity is the basename of $PWD. No config.
 
-_identity() {
-    # The agent's identity is the basename of its current workspace root.
-    basename "$PWD"
-}
+Subcommands (stable names; semantics aligned with the log):
+    whoami                              print agent identity (workspace basename)
+    inbox                               list unread records addressed to me or "all"
+    inbox --all                         list every record (debugging)
+    read <seq>                          print one record and advance cursor
+    peek <seq>                          print without advancing
+    mark-seen <seq>                     advance cursor to seq
+    send <recipient> <title>            read body from stdin, append record
+                                        [--in-reply-to <seq>]  enforce causal link
+    watch [interval] [cap]              block until any new record addressed to me,
+                                        then print ALL new records in this window
+                                        (interval sec poll, cap sec timeout;
+                                         defaults: interval=5, cap=1200)
+    whois                               unique senders in the log
+    clean                               rotate the log if older than 7 days
 
-_seen_file() {
-    echo "$SEEN_DIR/$(_identity).txt"
-}
+Legacy .md files in /tmp/agent-messages/ from the prior bus are ignored.
+"""
+from __future__ import annotations
 
-_is_seen() {
-    local fname="$1"
-    local seen_file
-    seen_file=$(_seen_file)
-    [ -f "$seen_file" ] && grep -Fxq "$fname" "$seen_file"
-}
+import fcntl
+import json
+import os
+import sys
+import time
+from datetime import datetime, timezone
+from pathlib import Path
 
-_mark_seen() {
-    local fname="$1"
-    local seen_file
-    seen_file=$(_seen_file)
-    touch "$seen_file"
-    if ! grep -Fxq "$fname" "$seen_file" 2>/dev/null; then
-        echo "$fname" >> "$seen_file"
-    fi
-}
+MSG_DIR = Path("/tmp/agent-messages")
+LOG_PATH = MSG_DIR / "events.log"
+CURSOR_DIR = MSG_DIR / ".cursor"
 
-_list_for_me() {
-    # Emit filenames (basenames) addressed to me or to "all", sorted by mtime ascending
-    # (oldest first, so iteration naturally surfaces historical order).
-    local me
-    me=$(_identity)
-    ( cd "$MSG_DIR" 2>/dev/null && ls -1tr 2>/dev/null ) \
-      | grep -E "^(${me}|all):" 2>/dev/null || true
-}
 
-cmd_whoami() {
-    _ensure_dirs
-    _identity
-}
+def identity() -> str:
+    """Agent identity = basename of the invoking workspace (PWD)."""
+    return os.path.basename(os.getcwd())
 
-cmd_inbox() {
-    _ensure_dirs
-    local show_all=0
-    if [ "${1:-}" = "--all" ]; then show_all=1; fi
 
-    if [ $show_all -eq 1 ]; then
-        cd "$MSG_DIR"
-        echo "# All messages in $MSG_DIR"
-        ls -lht 2>/dev/null | tail -n +2 | awk '{print $6, $7, $8, $9}' | grep -E "\.md$" || echo "(empty)"
+def cursor_path(who: str) -> Path:
+    return CURSOR_DIR / f"{who}.txt"
+
+
+def ensure_dirs() -> None:
+    MSG_DIR.mkdir(parents=True, exist_ok=True)
+    CURSOR_DIR.mkdir(parents=True, exist_ok=True)
+    if not LOG_PATH.exists():
+        LOG_PATH.touch()
+
+
+def read_cursor(who: str) -> int:
+    p = cursor_path(who)
+    if not p.exists():
         return 0
-    fi
-
-    local me
-    me=$(_identity)
-    echo "# Inbox for: $me"
-    echo "# Dir: $MSG_DIR"
-    echo ""
-
-    local files
-    files=$(_list_for_me)
-    if [ -z "$files" ]; then
-        echo "(no messages addressed to $me or all)"
+    try:
+        return int(p.read_text().strip() or "0")
+    except ValueError:
         return 0
-    fi
 
-    local unread=0
-    local read_count=0
-    echo "UNREAD:"
-    while IFS= read -r f; do
-        [ -z "$f" ] && continue
-        if _is_seen "$f"; then
-            read_count=$((read_count + 1))
-        else
-            unread=$((unread + 1))
-            # show mtime + filename
-            local mt
-            mt=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M" "$MSG_DIR/$f" 2>/dev/null || echo "??")
-            echo "  [$mt]  $f"
-        fi
-    done <<< "$files"
 
-    [ $unread -eq 0 ] && echo "  (none)"
+def write_cursor(who: str, seq: int) -> None:
+    p = cursor_path(who)
+    p.write_text(str(seq))
 
-    echo ""
-    echo "READ (still on disk, use 'read' to re-open):"
-    while IFS= read -r f; do
-        [ -z "$f" ] && continue
-        if _is_seen "$f"; then
-            local mt
-            mt=$(stat -f "%Sm" -t "%Y-%m-%d %H:%M" "$MSG_DIR/$f" 2>/dev/null || echo "??")
-            echo "  [$mt]  $f"
-        fi
-    done <<< "$files"
-    [ $read_count -eq 0 ] && echo "  (none)"
 
-    echo ""
-    echo "Summary: $unread unread, $read_count read."
-}
+def iter_records():
+    """Yield (seq, record_dict) for every line in the log.
 
-cmd_read() {
-    _ensure_dirs
-    local fname="${1:?usage: msg.sh read <filename>}"
-    local path="$MSG_DIR/$fname"
-    [ -f "$path" ] || { echo "no such message: $fname" >&2; exit 1; }
-    echo "=== $fname ==="
-    stat -f "mtime: %Sm" -t "%Y-%m-%d %H:%M:%S %Z" "$path"
-    echo "---"
-    cat "$path"
-    echo ""
-    _mark_seen "$fname"
-    echo "(marked seen)"
-}
+    seq is 1-indexed line number. Lines that fail to parse as JSON are skipped
+    with a warning on stderr (no silent loss).
+    """
+    if not LOG_PATH.exists():
+        return
+    with LOG_PATH.open("r", encoding="utf-8") as f:
+        seq = 0
+        for line in f:
+            seq += 1
+            line = line.rstrip("\n")
+            if not line:
+                continue
+            try:
+                rec = json.loads(line)
+            except json.JSONDecodeError as exc:
+                print(f"[msg.sh] skipping malformed record seq={seq}: {exc}",
+                      file=sys.stderr)
+                continue
+            yield seq, rec
 
-cmd_peek() {
-    _ensure_dirs
-    local fname="${1:?usage: msg.sh peek <filename>}"
-    local path="$MSG_DIR/$fname"
-    [ -f "$path" ] || { echo "no such message: $fname" >&2; exit 1; }
-    cat "$path"
-}
 
-cmd_send() {
-    _ensure_dirs
-    local recipient="${1:?usage: msg.sh send <recipient> <snippet>  (body via stdin)}"
-    local snippet="${2:?usage: msg.sh send <recipient> <snippet>  (body via stdin)}"
-    local from
-    from=$(_identity)
+def record_at(seq: int):
+    for s, rec in iter_records():
+        if s == seq:
+            return rec
+    return None
 
-    # Sanitize snippet: keep letters, numbers, dash, underscore, dot, space; trim.
-    local safe_snippet
-    safe_snippet=$(echo "$snippet" | tr -cs 'A-Za-z0-9._ -' '-' | sed 's/^-*//;s/-*$//' | cut -c 1-80)
-    [ -z "$safe_snippet" ] && safe_snippet="message"
 
-    local ts
-    ts=$(date -u '+%Y-%m-%dT%H:%M:%SZ')
-    local fname="${recipient}:${safe_snippet}.md"
-    local path="$MSG_DIR/$fname"
+def addressed_to_me(rec: dict, me: str) -> bool:
+    to = rec.get("to")
+    return to == me or to == "all"
 
-    # If colliding, append a numeric suffix.
-    local suffix=1
-    while [ -e "$path" ]; do
-        fname="${recipient}:${safe_snippet}-${suffix}.md"
-        path="$MSG_DIR/$fname"
-        suffix=$((suffix + 1))
-    done
 
-    {
-        echo "---"
-        echo "from: $from"
-        echo "to: $recipient"
-        echo "ts: $ts"
-        echo "---"
-        echo ""
-        cat  # body from stdin
-    } > "$path"
+def fmt_record(seq: int, rec: dict, indent: bool = True) -> str:
+    lines = []
+    lines.append(f"seq:          {seq}")
+    lines.append(f"ts:           {rec.get('ts', '?')}")
+    lines.append(f"from:         {rec.get('from', '?')}")
+    lines.append(f"to:           {rec.get('to', '?')}")
+    lines.append(f"title:        {rec.get('title', '')}")
+    if rec.get("in_reply_to"):
+        lines.append(f"in_reply_to:  {rec['in_reply_to']}")
+    lines.append("---")
+    lines.append(rec.get("body", ""))
+    return "\n".join(lines)
 
-    # Also mark this file as seen by the sender so it doesn't appear in their own inbox
-    # if they happen to also match the recipient (e.g. sent to 'all').
-    _mark_seen "$fname"
 
-    echo "sent → $fname"
-}
+def append_record(rec: dict) -> int:
+    """Atomic append. Returns the seq assigned to this record (1-indexed line number)."""
+    ensure_dirs()
+    with LOG_PATH.open("a+", encoding="utf-8") as f:
+        fcntl.flock(f.fileno(), fcntl.LOCK_EX)
+        try:
+            f.seek(0)
+            existing = sum(1 for _ in f)
+            seq = existing + 1
+            rec_with_seq = dict(rec)
+            rec_with_seq["seq"] = seq
+            f.write(json.dumps(rec_with_seq, ensure_ascii=False) + "\n")
+            f.flush()
+            os.fsync(f.fileno())
+        finally:
+            fcntl.flock(f.fileno(), fcntl.LOCK_UN)
+    return seq
 
-cmd_mark_seen() {
-    _ensure_dirs
-    local fname="${1:?usage: msg.sh mark-seen <filename>}"
-    _mark_seen "$fname"
-    echo "marked seen: $fname"
-}
 
-cmd_watch() {
-    _ensure_dirs
-    local interval="${1:-15}"
-    local cap="${2:-1200}"
-    local me
-    me=$(_identity)
-    local start
-    start=$(date +%s)
+# ----- Commands ------------------------------------------------------------
 
-    echo "[watch] identity=$me interval=${interval}s cap=${cap}s dir=$MSG_DIR"
+def cmd_whoami(args):
+    ensure_dirs()
+    print(identity())
 
-    while true; do
-        local now
-        now=$(date +%s)
-        local elapsed=$((now - start))
-        if [ $elapsed -ge "$cap" ]; then
-            echo "[watch] timeout after ${cap}s without new messages"
-            exit 2
-        fi
 
-        # Look for any unread file for this recipient.
-        local new_found=""
-        local files
-        files=$(_list_for_me)
-        while IFS= read -r f; do
-            [ -z "$f" ] && continue
-            if ! _is_seen "$f"; then
-                new_found="$f"
-                break
-            fi
-        done <<< "$files"
+def cmd_inbox(args):
+    ensure_dirs()
+    show_all = len(args) > 0 and args[0] == "--all"
+    me = identity()
+    cursor = read_cursor(me)
 
-        if [ -n "$new_found" ]; then
-            echo "[watch] NEW MESSAGE: $new_found"
-            echo "[watch] run: msg.sh read \"$new_found\""
-            exit 0
-        fi
+    unread = []
+    read = []
+    for seq, rec in iter_records():
+        if not show_all and not addressed_to_me(rec, me):
+            continue
+        if seq > cursor:
+            unread.append((seq, rec))
+        else:
+            read.append((seq, rec))
 
-        printf "[watch] %s no new messages (elapsed %ss)\n" "$(date '+%H:%M:%S')" "$elapsed"
-        sleep "$interval"
-    done
-}
+    header = "# All records" if show_all else f"# Inbox for: {me}"
+    print(header)
+    print(f"# Log: {LOG_PATH}  (cursor = {cursor})")
+    print()
 
-cmd_whois() {
-    _ensure_dirs
-    cd "$MSG_DIR"
-    # Collect recipients (prefix of every message filename).
-    ls -1 2>/dev/null | grep -E ":.*\.md$" | cut -d: -f1 | sort -u \
-      | grep -v '^$' || echo "(no messages yet)"
-}
+    print("UNREAD:")
+    if not unread:
+        print("  (none)")
+    for seq, rec in unread:
+        print(f"  [{seq:>5}] ({rec.get('ts', '?')})  "
+              f"{rec.get('from', '?')} → {rec.get('to', '?')}  "
+              f"| {rec.get('title', '')}")
+    print()
 
-cmd_clean() {
-    _ensure_dirs
-    local removed
-    removed=$(find "$MSG_DIR" -maxdepth 1 -name "*.md" -type f -mtime +7 -print -delete 2>/dev/null | wc -l | tr -d ' ')
-    echo "cleaned $removed messages older than 7 days"
-}
+    print("READ:")
+    if not read:
+        print("  (none)")
+    for seq, rec in read:
+        print(f"  [{seq:>5}] ({rec.get('ts', '?')})  "
+              f"{rec.get('from', '?')} → {rec.get('to', '?')}  "
+              f"| {rec.get('title', '')}")
+    print()
+    print(f"Summary: {len(unread)} unread, {len(read)} read.")
 
-main() {
-    local sub="${1:-inbox}"
-    shift || true
-    case "$sub" in
-        whoami)     cmd_whoami "$@" ;;
-        inbox|ls)   cmd_inbox "$@" ;;
-        read)       cmd_read "$@" ;;
-        peek)       cmd_peek "$@" ;;
-        send)       cmd_send "$@" ;;
-        mark-seen)  cmd_mark_seen "$@" ;;
-        watch)      cmd_watch "$@" ;;
-        whois)      cmd_whois "$@" ;;
-        clean)      cmd_clean "$@" ;;
-        -h|--help|help)
-            # Print only the top-of-file comment block (everything up to the first blank line
-            # after `set -euo pipefail` marker).
-            awk '/^set -euo pipefail/{exit} {print}' "$0"
-            ;;
-        *)
-            echo "unknown subcommand: $sub" >&2
-            echo "try: whoami | inbox | read | peek | send | mark-seen | watch | whois | clean" >&2
-            exit 1
-            ;;
-    esac
-}
 
-main "$@"
+def cmd_read(args):
+    ensure_dirs()
+    if not args:
+        print("usage: msg.sh read <seq>", file=sys.stderr)
+        sys.exit(1)
+    try:
+        seq = int(args[0])
+    except ValueError:
+        print(f"not a valid seq: {args[0]}", file=sys.stderr)
+        sys.exit(1)
+    rec = record_at(seq)
+    if rec is None:
+        print(f"no such record: seq={seq}", file=sys.stderr)
+        sys.exit(1)
+    print(fmt_record(seq, rec))
+    # Advance cursor to max(cursor, seq) — do not rewind.
+    me = identity()
+    write_cursor(me, max(read_cursor(me), seq))
+
+
+def cmd_peek(args):
+    ensure_dirs()
+    if not args:
+        print("usage: msg.sh peek <seq>", file=sys.stderr)
+        sys.exit(1)
+    try:
+        seq = int(args[0])
+    except ValueError:
+        print(f"not a valid seq: {args[0]}", file=sys.stderr)
+        sys.exit(1)
+    rec = record_at(seq)
+    if rec is None:
+        print(f"no such record: seq={seq}", file=sys.stderr)
+        sys.exit(1)
+    print(fmt_record(seq, rec))
+
+
+def cmd_mark_seen(args):
+    ensure_dirs()
+    if not args:
+        print("usage: msg.sh mark-seen <seq>", file=sys.stderr)
+        sys.exit(1)
+    try:
+        seq = int(args[0])
+    except ValueError:
+        print(f"not a valid seq: {args[0]}", file=sys.stderr)
+        sys.exit(1)
+    me = identity()
+    write_cursor(me, max(read_cursor(me), seq))
+    print(f"cursor advanced: {me} → {read_cursor(me)}")
+
+
+def cmd_send(args):
+    """send <recipient> <title>  (body on stdin)  [--in-reply-to <seq>]"""
+    ensure_dirs()
+    in_reply_to = None
+    positional: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--in-reply-to":
+            if i + 1 >= len(args):
+                print("--in-reply-to requires a seq", file=sys.stderr)
+                sys.exit(1)
+            try:
+                in_reply_to = int(args[i + 1])
+            except ValueError:
+                print(f"not a valid seq: {args[i + 1]}", file=sys.stderr)
+                sys.exit(1)
+            i += 2
+        else:
+            positional.append(a)
+            i += 1
+
+    if len(positional) < 2:
+        print("usage: msg.sh send <recipient> <title> [--in-reply-to <seq>]",
+              file=sys.stderr)
+        sys.exit(1)
+    recipient, title = positional[0], positional[1]
+
+    me = identity()
+
+    # Causal guard: can't reply to a record you haven't read.
+    # This is not a defensive check on the bus — it's a direct semantic rule:
+    # "in-reply-to seq N" asserts the sender has read through at least N. If
+    # their cursor is behind N, the assertion is false; reject rather than lie.
+    if in_reply_to is not None:
+        rec = record_at(in_reply_to)
+        if rec is None:
+            print(f"in-reply-to refers to missing seq: {in_reply_to}",
+                  file=sys.stderr)
+            sys.exit(1)
+        if read_cursor(me) < in_reply_to:
+            print(
+                f"cannot send: your cursor is {read_cursor(me)} but "
+                f"in-reply-to seq is {in_reply_to}. Read seq {in_reply_to} "
+                f"first, then retry.",
+                file=sys.stderr,
+            )
+            sys.exit(2)
+
+    body = sys.stdin.read()
+    ts = datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    rec = {
+        "ts": ts,
+        "from": me,
+        "to": recipient,
+        "title": title,
+        "in_reply_to": in_reply_to,
+        "body": body,
+    }
+    seq = append_record(rec)
+
+    # Self-acknowledge: advance own cursor past own send so broadcasts don't
+    # show up in our own inbox.
+    write_cursor(me, max(read_cursor(me), seq))
+
+    print(f"sent → seq={seq}  to={recipient}  title={title!r}")
+
+
+def cmd_watch(args):
+    """Block until new records addressed to me arrive; print ALL of them.
+
+    Exit codes:
+        0 = new records printed.
+        2 = cap elapsed with no new records.
+    """
+    ensure_dirs()
+    interval = float(args[0]) if len(args) >= 1 else 5.0
+    cap = float(args[1]) if len(args) >= 2 else 1200.0
+
+    me = identity()
+    start = time.time()
+    start_cursor = read_cursor(me)
+
+    print(f"[watch] identity={me} interval={interval}s cap={cap}s "
+          f"log={LOG_PATH} cursor={start_cursor}")
+
+    while True:
+        elapsed = time.time() - start
+        if elapsed >= cap:
+            print(f"[watch] timeout after {cap:.0f}s with no new messages")
+            sys.exit(2)
+
+        new = [
+            (seq, rec)
+            for seq, rec in iter_records()
+            if seq > start_cursor and addressed_to_me(rec, me)
+        ]
+        if new:
+            print(f"[watch] {len(new)} new message(s) for {me}:")
+            for seq, rec in new:
+                print(f"  [{seq}] {rec.get('from', '?')} → {rec.get('to', '?')}"
+                      f"  | {rec.get('title', '')}  ({rec.get('ts', '?')})")
+                if rec.get("in_reply_to"):
+                    print(f"        in_reply_to: {rec['in_reply_to']}")
+            print(f"[watch] run: msg.sh read <seq>  to read any of the above")
+            sys.exit(0)
+        time.sleep(interval)
+
+
+def cmd_whois(args):
+    ensure_dirs()
+    seen = set()
+    for _, rec in iter_records():
+        f = rec.get("from")
+        if f:
+            seen.add(f)
+    if not seen:
+        print("(no records yet)")
+        return
+    for f in sorted(seen):
+        print(f)
+
+
+def cmd_clean(args):
+    """Rotate the log if it is older than 7 days. Keeps all history, just archives."""
+    ensure_dirs()
+    if not LOG_PATH.exists():
+        print("no log to clean")
+        return
+    age_days = (time.time() - LOG_PATH.stat().st_mtime) / 86400.0
+    if age_days <= 7:
+        print(f"log is {age_days:.1f} days old — not rotating (threshold: 7d)")
+        return
+    ts = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    archive = MSG_DIR / f"events.{ts}.log"
+    LOG_PATH.rename(archive)
+    LOG_PATH.touch()
+    # Clear cursors so agents start fresh against the new empty log.
+    for cp in CURSOR_DIR.glob("*.txt"):
+        cp.write_text("0")
+    print(f"rotated → {archive}")
+
+
+def main():
+    argv = sys.argv[1:]
+    if not argv or argv[0] in ("-h", "--help", "help"):
+        print(__doc__)
+        return
+    sub, *rest = argv
+    handlers = {
+        "whoami": cmd_whoami,
+        "inbox": cmd_inbox,
+        "ls": cmd_inbox,
+        "read": cmd_read,
+        "peek": cmd_peek,
+        "mark-seen": cmd_mark_seen,
+        "send": cmd_send,
+        "watch": cmd_watch,
+        "whois": cmd_whois,
+        "clean": cmd_clean,
+    }
+    handler = handlers.get(sub)
+    if handler is None:
+        print(f"unknown subcommand: {sub}", file=sys.stderr)
+        print(f"try: {' | '.join(handlers)}", file=sys.stderr)
+        sys.exit(1)
+    handler(rest)
+
+
+if __name__ == "__main__":
+    main()

@@ -171,6 +171,12 @@ paths:
 
         This route is the canonical dispatch path. `POST /subagents` remains
         as a legacy alias for backwards compatibility.
+
+        **Pre-commitment**: Based on a completed dry run of this task, the
+        assistant should be able to confirm: the task succeeded end-to-end, the
+        instructions were sufficient, the resource budget was not near its limit,
+        and any lessons from that run have been folded into the message before
+        this dispatch.
       tags: [Subagents]
       requestBody:
         required: true
@@ -860,27 +866,198 @@ components:
       properties:
         message:
           type: string
-          description: The initial user-turn message that kicks off the subagent's ReAct loop.
-          example: "Research the top 3 Salesforce Enterprise tier pricing options and summarize."
+          description: |
+            The complete instruction set for the subagent. This single string is the
+            agent's entire starting context — it becomes the first `user` turn in the
+            ReAct loop. There is no human available to answer clarifying questions once
+            the run starts. Everything the agent needs to do its job must be here.
+
+            **Write it like a senior engineer handing off a task to an autonomous
+            contractor who has never worked on this project before.**
+
+            ---
+
+            ### Structure that works well
+
+            A high-quality message typically includes these sections (adapt as needed):
+
+            **1. Objective** — One or two sentences stating the exact goal and the
+            expected deliverable. Be specific: "Return a JSON object with fields X, Y, Z"
+            is better than "summarize the data."
+
+            **2. Context** — What the agent needs to know up-front: relevant IDs, URLs,
+            record names, date ranges, prior run results, or any state that would
+            otherwise require a lookup the agent has no way to perform.
+
+            **3. Constraints & preferences** — Hard rules the agent must follow. Examples:
+            do not modify production data, prefer API X over API Y for this data type,
+            stop and report if the record count exceeds N, write output in markdown.
+
+            **4. Acceptance criteria** — How the agent (and you) will know the task is
+            done. A checklist is ideal. The agent uses this to decide when to call
+            `deliver_final_response`.
+
+            **5. On-failure guidance** — What to do if a step fails or returns unexpected
+            data. Should it retry, skip, or report partial results? An agent that hits an
+            unexpected 404 and has no guidance will burn turns guessing.
+
+            ---
+
+            ### Learnings from running these autonomously
+
+            - **Be explicit about IDs and record names.** The agent cannot ask "which
+              project did you mean?" — it will guess or fail. Paste the exact ID or slug.
+
+            - **State the output format up front.** If you want a markdown table, a JSON
+              blob, a numbered list, or a prose summary, say so. The agent defaults to
+              prose if not told otherwise.
+
+            - **Mention which API servers to use when it matters.** The agent has access
+              to whatever servers are enabled on your account. If there are two plausible
+              tools for a step, naming the preferred one eliminates a branching decision
+              and saves turns.
+
+            - **Do not rely on the agent to discover preconditions.** If a step requires
+              an OAuth connection, a specific environment variable, or a file to exist,
+              verify those preconditions before dispatching. The agent will spend turns
+              discovering the gap and may fail instead of skipping.
+
+            - **Turn budget is real.** Default is 30 turns, hard max 50. Each tool call
+              is a turn. A task that requires 10 API calls plus summarization needs a
+              `max_turns` budget that accounts for retries and reasoning steps. Vague
+              tasks that require exploration can easily exhaust the budget before reaching
+              the deliverable.
+
+            - **The label defaults to the first 60 characters of this field.** If you
+              need a human-readable dashboard label that differs from the opening line of
+              your instructions, set `label` explicitly.
+
+            - **The agent has no memory of prior runs by default.** If a prior run
+              produced a result you want this run to build on, include the relevant
+              excerpts directly in this message. Do not assume the agent will find them.
+
+            - **Avoid open-ended research tasks without a stopping condition.** "Research
+              everything about X" will run until turn cap. Add a stopping condition:
+              "Stop after finding 5 sources" or "Stop once you have pricing for all three
+              tiers."
+
+            - **Error text that starts with `ERROR:` is treated as a task failure** by
+              the runner. If you instruct the agent to emit structured error output,
+              do not prefix it with `ERROR:` unless you intend that to mark the run
+              as failed.
+
+            ---
+
+            ### Always do a dry run before scheduling
+
+            Before committing a task to a recurring schedule, **run it once manually
+            as a one-off dispatch** and let it complete. Treat that run as a dry run
+            or soft run — a chance to confirm the task is correctly specified before
+            it runs unattended on a schedule.
+
+            A completed dry run tells you:
+
+            - **Whether the task succeeds end-to-end** under real conditions — real
+              API calls, real data, real auth tokens. Mocked logic never reveals the
+              quota limits, pagination quirks, or schema surprises that only show up
+              against production.
+
+            - **Whether the turn budget is right.** Check `turns_used` on the
+              completed task (`GET /subagents/{id}/response`). If the agent used 28
+              of 30 turns, increase `max_turns` before scheduling. A scheduled run
+              that hits the cap midway produces a partial, silent non-result.
+
+            - **Whether the message is complete.** Dry-run failures are almost always
+              caused by missing context in the message — an ambiguous ID, a missing
+              constraint, a precondition the agent had to guess. Fix the message
+              before you schedule, not after three failed overnight runs.
+
+            - **Learnings the agent recorded.** After a completed run, retrieve
+              `GET /subagents/{id}/response?include_lessons_learned=true` and read
+              `lessons_learned`. The agent records which API servers it used, what
+              errors it hit and how it resolved them, efficiency notes for the next
+              run, and whether follow-up is needed. Feed any actionable findings back
+              into the message before scheduling.
+
+            - **The exact `label` to use.** The dry-run task appears in your dashboard
+              with the auto-generated label. If it's not readable, set `label`
+              explicitly on the scheduled dispatch.
+
+            Dry runs are cheap — a task that costs 20 turns once costs 20 turns every
+            scheduled run too. The difference is that a failed scheduled run produces
+            nothing and notifies no one until you check. A failed dry run fails in
+            front of you, right now, while you can act on it.
+
+            ---
+
+            ### Minimal example
+
+            ```
+            Objective: Fetch the current plan name and seat count for workspace ws_abc123
+            from the Billing API and return them as a JSON object: {"plan": "...", "seats": N}.
+
+            Context: The workspace ID is ws_abc123. Use the Billing API server.
+            The response field that holds plan name is `subscription.plan.name` and
+            seat count is `subscription.quantity`.
+
+            Constraints: Read-only. Do not call any mutation endpoints.
+
+            Acceptance criteria:
+            - JSON object with "plan" (string) and "seats" (integer) is delivered.
+            - If the workspace is not found, deliver {"error": "not_found"} instead
+              of failing the run.
+            ```
+
+          example: |
+            Objective: Fetch the current plan name and seat count for workspace ws_abc123
+            from the Billing API and return them as JSON: {"plan": "...", "seats": N}.
+
+            Context: workspace ID = ws_abc123. Use the Billing API server.
+            Plan name is at subscription.plan.name; seat count at subscription.quantity.
+
+            Constraints: read-only, no mutation endpoints.
+
+            Acceptance criteria:
+            - JSON object with "plan" and "seats" is delivered.
+            - If workspace not found, deliver {"error": "not_found"} rather than failing.
         persona_id:
           type: string
           nullable: true
-          description: Persona to run the subagent as. Defaults to `cowork-enterprise`.
+          description: |
+            Persona to run the subagent as. Controls the system prompt injected at the
+            start of the ReAct loop. Defaults to `cowork-enterprise`. Only change this
+            if you need a persona with a different tool set or behavioral profile.
           example: "cowork-enterprise"
         max_turns:
           type: integer
           nullable: true
           minimum: 1
           maximum: 50
-          description: Cap on reasoning turns. Defaults to 30, hard-capped at 50.
+          description: |
+            Cap on ReAct reasoning turns. Defaults to 30, hard-capped at 50.
+
+            Each tool call consumes one turn. Budget conservatively: a task requiring
+            10 API calls should have `max_turns` of at least 20 to allow for retries
+            and reasoning steps between calls. If the agent hits the cap before calling
+            `deliver_final_response`, the run completes with whatever partial output
+            exists in the thread — it does NOT automatically fail, but the deliverable
+            will be incomplete.
         label:
           type: string
           nullable: true
-          description: Short human-readable label for dashboards. Defaults to the first 60 chars of `message`.
+          description: |
+            Short human-readable label shown in dashboards and notification summaries.
+            Defaults to the first 60 characters of `message`. Set this explicitly when
+            the opening line of your message is not a good dashboard label (e.g., when
+            `message` starts with "Objective:" or a long context block).
+          example: "Fetch billing plan for ws_abc123"
         execution_mode:
           type: string
           nullable: true
-          description: Advanced — passed through to the runner.
+          description: |
+            Execution mode passed through to the chat runner. Defaults to `autonomous`.
+            In autonomous mode the agent runs without any human-in-the-loop checkpoints.
+            Leave unset unless you have a specific runner mode to target.
 
     DispatchSubagentResponse:
       type: object
