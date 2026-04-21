@@ -15,7 +15,7 @@ import os
 from dataclasses import dataclass
 from typing import Optional
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 
 logger = logging.getLogger(__name__)
 
@@ -102,3 +102,11 @@ def authenticate_jwt(request: Request) -> Optional[Identity]:
     if not claims:
         return None
     return _identity_from_claims(claims)
+
+
+def require_identity(request: Request) -> Identity:
+    """Authenticate or raise — used by external routes that expect a logged-in user."""
+    ident = authenticate_jwt(request)
+    if ident is None:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    return ident
