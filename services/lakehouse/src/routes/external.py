@@ -62,7 +62,7 @@ async def openapi_spec():
 
 @router.get("")
 async def api_list(request: Request):
-    ident = require_identity(request)
+    ident = await require_identity(request)
     db = await get_db()
     result = await list_assets(
         db,
@@ -81,7 +81,7 @@ async def api_list(request: Request):
 
 @router.get("/search")
 async def api_search(request: Request):
-    ident = require_identity(request)
+    ident = await require_identity(request)
 
     q = request.query_params.get("q")
     if not q:
@@ -102,7 +102,7 @@ async def api_search(request: Request):
 @router.post("/search")
 async def api_search_post(request: Request):
     """POST search with JSON body — used by agent/MCP callers."""
-    ident = require_identity(request)
+    ident = await require_identity(request)
 
     body = await request.json()
     query_text = body.get("query")
@@ -127,7 +127,7 @@ async def api_upload(
     files: list[UploadFile] = File(...),
     tenant_id: Optional[str] = Form(None),
 ):
-    ident = require_identity(request)
+    ident = await require_identity(request)
 
     effective_tenant = tenant_id or ident.tenant_id
 
@@ -149,7 +149,7 @@ async def api_upload(
 
 @router.post("/ingest")
 async def api_ingest(request: Request):
-    ident = require_identity(request)
+    ident = await require_identity(request)
 
     body = await request.json()
     filename = body.get("filename")
@@ -194,7 +194,7 @@ async def api_session_artifact(
     Keyed on (user_id, session_id, artifact_path). Repeated writes to the same
     path within the same session overwrite the existing asset_id and s3_key.
     """
-    ident = require_identity(request)
+    ident = await require_identity(request)
 
     file_bytes = await file.read()
     result = await persist_session_artifact(
@@ -220,7 +220,7 @@ async def api_session_artifact(
 @router.post("/code-script")
 async def api_code_script(request: Request):
     """Store a code-execution script as an asset with rolling FIFO cap per user."""
-    ident = require_identity(request)
+    ident = await require_identity(request)
 
     body = await request.json()
     code = body.get("code")
@@ -247,7 +247,7 @@ async def api_delete_session(session_id: str, request: Request):
 
     ?keep_outputs=true preserves artifact_path beginning with user_outputs/ or drafts/.
     """
-    ident = require_identity(request)
+    ident = await require_identity(request)
 
     keep_outputs_raw = request.query_params.get("keep_outputs", "false").lower()
     keep_outputs = keep_outputs_raw in ("1", "true", "yes")
@@ -265,7 +265,7 @@ async def api_delete_session(session_id: str, request: Request):
 
 @router.put("/{asset_id}")
 async def api_update(asset_id: str, request: Request):
-    ident = require_identity(request)
+    ident = await require_identity(request)
 
     body = await request.json()
     b64 = body.get("base64_content")
@@ -295,7 +295,7 @@ async def api_update(asset_id: str, request: Request):
 
 @router.get("/{asset_id}")
 async def api_get(asset_id: str, request: Request):
-    ident = require_identity(request)
+    ident = await require_identity(request)
 
     include_page_text = request.query_params.get("include_page_text", "false").lower() == "true"
 
@@ -325,7 +325,7 @@ async def api_get(asset_id: str, request: Request):
 
 @router.get("/{asset_id}/download")
 async def api_download(asset_id: str, request: Request):
-    ident = require_identity(request)
+    ident = await require_identity(request)
 
     db = await get_db()
     asset = await get_asset(db, asset_id, user_id=ident.user_id)
@@ -351,7 +351,7 @@ async def api_download(asset_id: str, request: Request):
 
 @router.post("/{asset_id}/promote")
 async def api_promote(asset_id: str, request: Request):
-    ident = require_identity(request)
+    ident = await require_identity(request)
 
     db = await get_db()
     promoted = await promote_session_artifact(
@@ -367,7 +367,7 @@ async def api_promote(asset_id: str, request: Request):
 
 @router.get("/{asset_id}/view")
 async def api_view(asset_id: str, request: Request):
-    ident = require_identity(request)
+    ident = await require_identity(request)
 
     db = await get_db()
     asset = await get_asset(
@@ -488,7 +488,7 @@ async def api_view(asset_id: str, request: Request):
 
 @router.get("/{asset_id}/bytes")
 async def api_bytes(asset_id: str, request: Request):
-    ident = require_identity(request)
+    ident = await require_identity(request)
 
     db = await get_db()
     asset = await get_asset(
@@ -517,7 +517,7 @@ async def api_bytes(asset_id: str, request: Request):
 
 @router.get("/{asset_id}/text")
 async def api_text(asset_id: str, request: Request):
-    ident = require_identity(request)
+    ident = await require_identity(request)
 
     db = await get_db()
     asset = await get_asset(
@@ -543,7 +543,7 @@ async def api_text(asset_id: str, request: Request):
 
 @router.delete("/{asset_id}")
 async def api_delete(asset_id: str, request: Request):
-    ident = require_identity(request)
+    ident = await require_identity(request)
 
     db = await get_db()
     deleted = await delete_asset(db, asset_id, user_id=ident.user_id)
