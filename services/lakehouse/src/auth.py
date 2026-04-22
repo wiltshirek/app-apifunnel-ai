@@ -1,11 +1,12 @@
-"""Authentication helpers — mirrors the bridge's dual-auth pattern.
+"""Authentication helpers.
 
-Internal routes:
-    Authorization: Bearer <MCP_ADMIN_KEY>
-    X-User-Token: <user JWT>  (decoded without signature verification)
+Auth contract (same as code-execution API):
+    Admin-key callers:
+        Authorization: Bearer <MCP_ADMIN_KEY>
+        user_id / instance_id as query params (GET) or body fields (POST)
 
-External routes:
-    Authorization: Bearer <user JWT>
+    Direct callers (MCP, browser):
+        Authorization: Bearer <user JWT>
 """
 
 import base64
@@ -74,25 +75,6 @@ def verify_admin_key(request: Request) -> bool:
     return token == expected
 
 
-def authenticate_internal(request: Request) -> Optional[Identity]:
-    """Dual-auth for /internal/* routes.
-
-    1. Authorization: Bearer <MCP_ADMIN_KEY>  →  identity from X-User-Token
-    2. Else fall through to JWT in Authorization header
-    """
-    if verify_admin_key(request):
-        user_token = request.headers.get("x-user-token") or ""
-        claims = _decode_jwt_payload(user_token)
-        if claims:
-            ident = _identity_from_claims(claims)
-            if ident:
-                ident.is_admin = True
-                return ident
-        return None
-
-    return authenticate_jwt(request)
-
-
 def authenticate_jwt(request: Request) -> Optional[Identity]:
     """Authenticate via Bearer JWT in Authorization header."""
     auth = request.headers.get("authorization") or ""
@@ -105,7 +87,21 @@ def authenticate_jwt(request: Request) -> Optional[Identity]:
 
 
 def require_identity(request: Request) -> Identity:
-    """Authenticate or raise — used by external routes that expect a logged-in user."""
+    """Authenticate or raise.
+
+    1. Admin-key caller → identity from query params.
+    2. Else → identity from JWT in Authorization header.
+    """
+    if verify_admin_key(request):
+        user_id = request.query_params.get("user_id")
+        if not user_id:
+            raise HTTPException(status_code=400, detail="Admin-key caller must provide user_id")
+        return Identity(
+            user_id=user_id,
+            instance_id=request.query_params.get("instance_id"),
+            is_admin=True,
+        )
+
     ident = authenticate_jwt(request)
     if ident is None:
         raise HTTPException(status_code=401, detail="Unauthorized")
