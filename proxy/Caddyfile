@@ -5,7 +5,8 @@
 
 api.apifunnel.ai {
     # ── Lakehouse (Python :3002) ──────────────────────────────────
-    handle /internal/assets/* {
+    handle /internal/assets* {
+        uri replace /internal/assets /api/v1/assets
         reverse_proxy localhost:3002
     }
     handle /api/v1/assets {
