@@ -16,8 +16,9 @@ You are the local assistant for this monorepo. This document is your complete ru
                                  │
               ┌──────────────────┼──────────────────┐
               │                  │                   │
-   /v1/*  /health    /internal/assets/*      /graphiti/*
-   (catch-all)       /api/v1/assets/*        (optional)
+   /v1/*  /health    /api/v1/assets/*         /graphiti/*
+   (catch-all)   (/internal/assets/* rewrites  (optional)
+                  here via Caddy uri replace)
               │                  │                   │
               ▼                  ▼                   ▼
    ┌──────────────────┐ ┌──────────────────┐ ┌───────────┐
@@ -38,8 +39,8 @@ You are the local assistant for this monorepo. This document is your complete ru
 
 | Path pattern             | Routed to    | Port |
 |--------------------------|------------- |------|
-| `/internal/assets/*`     | Lakehouse    | 3002 |
 | `/api/v1/assets/*`       | Lakehouse    | 3002 |
+| `/internal/assets/*`     | Lakehouse    | 3002 (Caddy rewrites to `/api/v1/assets/*`) |
 | `/v1/*`                  | Subagents| 3001 |
 | `/graphiti/*`            | Graphiti     | 8001 |
 | `/health`                | Subagents| 3001 |
@@ -91,9 +92,9 @@ curl -s http://localhost:3002/api/v1/assets \
   -H "Authorization: Bearer $(cat .env | grep MCP_ADMIN_KEY | cut -d= -f2-)" \
   | head -c 200
 
-# Internal search (admin key + user token pattern)
+# Search assets (admin key + user token pattern, via Caddy on :3000)
 ADMIN_KEY=$(grep MCP_ADMIN_KEY .env | cut -d= -f2-)
-curl -s http://localhost:3002/internal/assets/search?q=test \
+curl -s "http://localhost:3000/api/v1/assets/search?q=test" \
   -H "Authorization: Bearer $ADMIN_KEY" \
   -H "X-User-Token: eyJhbGciOiJub25lIn0.eyJzdWIiOiJ0ZXN0LXVzZXIiLCJ0ZW5hbnRfaWQiOiJ0ZXN0In0."
 ```
@@ -495,8 +496,7 @@ api-apifunnel-ai/
 │           ├── db.py         # Motor MongoDB connection
 │           ├── auth.py       # JWT decode, admin key, dual-auth
 │           ├── routes/
-│           │   ├── internal.py   # /internal/assets/* (MCP_ADMIN_KEY)
-│           │   └── external.py   # /api/v1/assets/* (Bearer JWT)
+│           │   └── external.py   # /api/v1/assets/* (Bearer JWT + admin key)
 │           ├── services/
 │           │   └── assets.py     # Upload, search, thumbnails, PDF extraction
 │           └── storage/

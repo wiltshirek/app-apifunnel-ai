@@ -1,6 +1,7 @@
 """Lakehouse API — standalone asset storage and retrieval service.
 
-Runs on port 3002. Caddy routes /internal/assets/* and /api/v1/assets/* here.
+Runs on port 3002. Caddy routes all traffic here under /api/v1/assets/*.
+Requests arriving via /internal/assets/* are rewritten by Caddy before hitting FastAPI.
 """
 
 import logging
