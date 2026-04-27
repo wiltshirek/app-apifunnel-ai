@@ -240,37 +240,42 @@ async def list_assets(
     limit: int = 50,
     cursor: Optional[str] = None,
     tags: Optional[str] = None,
+    query: Optional[str] = None,
 ) -> Dict[str, Any]:
     from ..storage.s3 import get_presigned_url
+    import re as _re
 
     if not user_id:
         return {"assets": [], "next_cursor": None, "has_more": False}
 
     limit = max(1, limit)
-    query: Dict[str, Any] = {"user_id": user_id}
+    mongo_filter: Dict[str, Any] = {"user_id": user_id}
     if content_type:
-        query["content_type"] = content_type
+        mongo_filter["content_type"] = content_type
     if tenant_id:
-        query["tenant_id"] = tenant_id
+        mongo_filter["tenant_id"] = tenant_id
     if tags:
-        query["tags"] = tags
+        mongo_filter["tags"] = tags
     else:
-        query["tags"] = {"$ne": "code_script"}
+        mongo_filter["tags"] = {"$ne": "code_script"}
+    if query:
+        mongo_filter["filename"] = {"$regex": _re.escape(query), "$options": "i"}
 
     if cursor:
         try:
             from datetime import datetime as _dt, timezone
             cursor_dt = _dt.fromisoformat(cursor.replace("Z", "+00:00"))
-            query["created_at"] = {"$lt": cursor_dt}
+            mongo_filter["created_at"] = {"$lt": cursor_dt}
         except (ValueError, AttributeError):
-            pass
+            return {"assets": [], "next_cursor": None, "has_more": False,
+                    "error": f"Invalid cursor: expected ISO datetime, got '{cursor}'"}
 
-    query["$or"] = [
+    mongo_filter["$or"] = [
         {"session_id": {"$exists": False}},
         {"is_ephemeral": False},
     ]
 
-    raw = await db.assets.find(query).sort("created_at", -1).limit(limit + 1).to_list(length=limit + 1)
+    raw = await db.assets.find(mongo_filter).sort("created_at", -1).limit(limit + 1).to_list(length=limit + 1)
     has_more = len(raw) > limit
     if has_more:
         raw = raw[:limit]

@@ -71,6 +71,7 @@ async def api_list(request: Request):
         tenant_id=ident.tenant_id,
         limit=int(request.query_params.get("limit", "50")),
         cursor=request.query_params.get("cursor"),
+        query=request.query_params.get("query"),
     )
 
     for asset in result.get("assets", []):
