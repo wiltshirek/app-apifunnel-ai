@@ -106,6 +106,11 @@ paths:
           in: query
           schema:
             type: string
+        - name: tags
+          in: query
+          schema:
+            type: string
+          description: Filter by tag value. When omitted, code_script assets are excluded by default.
         - name: query
           in: query
           schema:
