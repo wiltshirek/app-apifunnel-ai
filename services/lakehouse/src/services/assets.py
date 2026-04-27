@@ -16,6 +16,16 @@ logger = logging.getLogger(__name__)
 THUMBNAIL_MAX_SIZE = 200
 THUMBNAIL_DPI = 72
 
+_TEXT_PREFIXES = ("text/",)
+_TEXT_EXACT = frozenset({
+    "application/json", "application/xml", "application/yaml",
+    "application/x-yaml", "application/csv",
+})
+
+
+def _is_text_type(content_type: str) -> bool:
+    return content_type.startswith(_TEXT_PREFIXES) or content_type in _TEXT_EXACT
+
 
 def _generate_asset_id() -> str:
     try:
@@ -159,6 +169,11 @@ async def upload_asset(
         document_metadata = {"page_count": pdf["page_count"], "pages": [{"num": p["num"], "char_count": p["char_count"]} for p in pdf["pages"]]}
         extracted_text = pdf["full_text"]
         page_text_store = {str(p["num"]): p["text"] for p in pdf["pages"]}
+    elif _is_text_type(content_type):
+        try:
+            extracted_text = file_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            pass
 
     now = datetime.utcnow()
     asset_doc: Dict[str, Any] = {
@@ -410,9 +425,15 @@ async def update_asset(
         }
         extracted_text = pdf["full_text"]
         page_text_store = {str(p["num"]): p["text"] for p in pdf["pages"]}
-    elif not content_type.startswith("application/pdf"):
-        # For non-PDF text types, clear stale PDF extraction if content type changed
-        if existing.get("content_type") == "application/pdf" and not content_type == "application/pdf":
+    elif _is_text_type(content_type):
+        try:
+            extracted_text = file_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            extracted_text = None
+        document_metadata = None
+        page_text_store = None
+    else:
+        if existing.get("content_type") == "application/pdf":
             document_metadata = None
             extracted_text = None
             page_text_store = None
