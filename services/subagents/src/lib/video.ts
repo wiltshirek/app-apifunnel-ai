@@ -77,7 +77,9 @@ function execFileAsync(
 async function probeDuration(url: string): Promise<number> {
   try {
     const { stdout } = await execFileAsync('yt-dlp', [
-      '--dump-json', '--no-download', '--no-warnings', url,
+      '--dump-json', '--no-download', '--no-warnings',
+      '--extractor-args', 'youtube:player_client=mediaconnect',
+      url,
     ], { timeout: 60_000 });
     const info = JSON.parse(stdout);
     return info.duration ?? 0;
@@ -99,6 +101,7 @@ async function downloadVideo(url: string, tmpDir: string): Promise<string> {
       '-o', outputTemplate,
       '--no-playlist',
       '--no-warnings',
+      '--extractor-args', 'youtube:player_client=mediaconnect',
       url,
     ], { timeout: DOWNLOAD_TIMEOUT_MS });
   } catch (err: any) {
@@ -129,6 +132,7 @@ async function extractCaptions(url: string, tmpDir: string): Promise<string | nu
       '--skip-download',
       '-o', join(tmpDir, 'subs'),
       '--no-warnings',
+      '--extractor-args', 'youtube:player_client=mediaconnect',
       url,
     ], { timeout: 60_000 });
   } catch {
