@@ -418,6 +418,78 @@ paths:
             Video pipeline timed out (`video_timeout`) — download or frame
             extraction exceeded the time limit.
 
+  /subagents/create-image:
+    post:
+      operationId: createImage
+      summary: Generate an image from a text prompt using OpenAI gpt-image-2
+      description: |
+        **Image generation agent node.** Wraps OpenAI's `gpt-image-2` model as
+        a stateless, single-shot image generation endpoint. Accepts a text prompt,
+        generates an image, and returns it as base64-encoded data.
+
+        Same auth flow as `/subagents/one-shot` — the user's OpenAI key is
+        extracted from `api_settings` on the JWT. Falls back to the server's
+        `WHISPER_OPENAI_API_KEY` for local development.
+
+        The response shape (`base64`, `content_type`, `size_bytes`) mirrors the
+        lakehouse asset view endpoints, so downstream consumers (assistant,
+        lakehouse upload) can handle the output identically.
+
+        ### Agent node characteristics
+
+        - **Stateless** — no threads, no memory, no task rows.
+        - **Synchronous** — the generated image is returned in the same HTTP call.
+        - **Composable** — can be invoked standalone or embedded in any workflow.
+        - **OpenAI-only** — always uses `gpt-image-2`. No provider routing.
+      tags: [Subagents]
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CreateImageRequest'
+            examples:
+              simple:
+                summary: "Simple image generation"
+                value:
+                  prompt: "A watercolor painting of a mountain lake at sunrise"
+              detailed:
+                summary: "With size, quality, and format options"
+                value:
+                  prompt: "A minimalist line drawing of a cat sitting on a windowsill"
+                  size: "1024x1536"
+                  quality: "high"
+                  output_format: "png"
+      responses:
+        '200':
+          description: |
+            Image generated successfully. The `base64` field contains the
+            base64-encoded image bytes. The `content_type` and `size_bytes`
+            fields describe the output. `revised_prompt` is the prompt that
+            OpenAI actually used (may differ from the input prompt).
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CreateImageResponse'
+              example:
+                base64: "<base64-encoded image bytes>"
+                content_type: "image/png"
+                size_bytes: 234567
+                revised_prompt: "A watercolor painting of a serene mountain lake at sunrise with soft pink and gold light reflecting on the water."
+                model: "gpt-image-2"
+                provider: "openai"
+        '400':
+          description: |
+            Missing `prompt` or no OpenAI API key available (`missing_api_key`).
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          description: |
+            OpenAI rejected the request — content policy violation or invalid
+            parameters.
+        '500':
+          description: Upstream provider or internal error.
+
   /subagents/{id}:
     get:
       operationId: getSubagentStatus
@@ -1411,6 +1483,74 @@ components:
         provider:
           type: string
           enum: [openai, anthropic, google]
+
+    CreateImageRequest:
+      type: object
+      required: [prompt]
+      description: |
+        Input to the image generation agent node. Accepts a text prompt and
+        optional configuration for size, quality, and output format.
+      properties:
+        prompt:
+          type: string
+          description: |
+            The text description of the image to generate. Be specific — the
+            more detailed the prompt, the better the result.
+          example: "A watercolor painting of a mountain lake at sunrise"
+        size:
+          type: string
+          nullable: true
+          enum: ["1024x1024", "1024x1536", "1536x1024"]
+          default: "1024x1024"
+          description: |
+            Output image dimensions. `1024x1024` (square), `1024x1536`
+            (portrait), or `1536x1024` (landscape).
+        quality:
+          type: string
+          nullable: true
+          enum: [low, medium, high]
+          default: "high"
+          description: Image generation quality level.
+        output_format:
+          type: string
+          nullable: true
+          enum: [png, webp, jpeg]
+          default: "png"
+          description: Output image format.
+
+    CreateImageResponse:
+      type: object
+      required: [base64, content_type, size_bytes, model, provider]
+      description: |
+        Generated image output. The shape (`base64`, `content_type`,
+        `size_bytes`) mirrors the lakehouse asset view endpoints for
+        consistent downstream handling.
+      properties:
+        base64:
+          type: string
+          description: Base64-encoded image bytes.
+        content_type:
+          type: string
+          description: MIME type of the generated image.
+          example: "image/png"
+        size_bytes:
+          type: integer
+          description: Size of the decoded image in bytes.
+          example: 234567
+        revised_prompt:
+          type: string
+          nullable: true
+          description: |
+            The prompt that OpenAI actually used for generation. May differ
+            from the input prompt due to internal rewording.
+        model:
+          type: string
+          description: The model used for generation.
+          example: "gpt-image-2"
+        provider:
+          type: string
+          enum: [openai]
+          description: Always `openai` for image generation.
 
     TranscriptResponse:
       type: object
