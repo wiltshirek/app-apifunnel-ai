@@ -201,35 +201,76 @@ paths:
   /subagents/one-shot:
     post:
       operationId: oneShotAgent
-      summary: Embedded agent — single direct LLM call (no ReAct, no tools)
+      summary: Multimodal agent node — stateless, single-turn LLM inference over text, images, and video
       description: |
-        **Direct LLM primitive.** Takes a prompt (plus optional media), calls
-        the user's LLM provider directly using the `api_settings` carried in
-        their JWT, returns the completion synchronously.
+        **Embedded agent node for multimodal inference.** This endpoint is a
+        composable, stateless building block that any orchestrator, workflow,
+        or agent graph can invoke as a single node. It accepts a prompt with
+        optional media (text, images, video, or any combination), executes
+        one LLM inference turn, and returns a structured result.
 
-        This is **not** a subagent dispatch. There is no ReAct loop, no tool
-        use, no persona prompt, no conversation thread, no task row, no
-        progress stream. It is the platform equivalent of the retired
-        `hitl_api.get_agent_response` primitive.
+        As an agent node, it is designed to be dropped into any agentic
+        pipeline — reasoning graphs, DAGs, ReAct loops, or simple
+        sequential chains — wherever a single-turn LLM judgment is needed.
+        It owns no state, manages no threads, and has no side effects. The
+        orchestrator controls sequencing, branching, and memory.
+
+        ### Supported modalities
+
+        - **Text only** — classification, summarization, extraction,
+          evaluation, judgment calls, structured data generation
+        - **Text + images** — visual QA, screenshot analysis, UI review,
+          document understanding, diagram interpretation, before/after
+          comparison
+        - **Text + video** — video summarization, content review, tutorial
+          analysis, meeting recap, visual event detection, timestamped
+          segment extraction
+        - **Any combination** — e.g., "Compare this screenshot to what is
+          shown at the 2-minute mark in this video"
+
+        ### Media handling
+
+        The caller sends a `prompt` (required) and an optional `media` array.
+        Each media item has a `url` and a `type` (MIME type). The agent node
+        inspects the media and routes accordingly:
+
+        - **`image/*`** — Passed directly to the LLM provider as a vision
+          input. No server-side processing. The model sees the image as-is.
+
+        - **`video/*`** or **known video host URL** (YouTube) — The agent
+          node runs a preprocessing pipeline automatically:
+          1. Downloads the video via yt-dlp
+          2. Extracts key frames via ffmpeg (10–100 frames, scaled to 720p)
+          3. Pulls captions from the video source (or transcribes audio via
+             Whisper if no captions are available)
+          4. Builds a multimodal prompt: transcript → frames interleaved
+             with timestamps → caller's prompt
+          5. Sends the assembled content to the LLM provider
+
+          The caller does not need to handle any of this. The video pipeline
+          is entirely server-side. Whisper transcription keys are
+          server-supplied. Prompt + URL in, structured analysis out.
+
+        ### Provider selection
 
         Provider is inferred from the `model` prefix:
           - `gpt-*`, `o1*`, `o3*`, `o4*` → OpenAI
           - `claude-*` → Anthropic
           - `gemini-*` → Google
 
-        The caller's JWT must carry `api_settings.<provider>.api_key` for the
-        inferred provider, or the endpoint returns 400.
+        The caller's JWT must carry `api_settings.<provider>.api_key` for
+        the inferred provider, or the endpoint returns 400.
 
-        **Video support:** When `media[].type` starts with `video/` or
-        `media[].url` matches a known video host (YouTube), the server
-        automatically runs a video preprocessing pipeline: download via yt-dlp,
-        extract frames via ffmpeg, pull captions (or transcribe via Whisper),
-        then build a multimodal prompt with interleaved frames and transcript.
-        The caller's contract is unchanged — prompt + URL in, analysis out.
+        ### Agent node characteristics
 
-        Whisper transcription keys (Groq, OpenAI) are server-supplied. The
-        caller does not need to provide them. The LLM model key for the
-        analysis call still comes from the caller's `api_settings`.
+        - **Stateless** — no threads, no memory, no task rows. Every call
+          is independent.
+        - **Synchronous** — the response is returned in the same HTTP call.
+        - **Composable** — can be invoked from any orchestrator, workflow
+          engine, or agent framework as a single inference step.
+        - **Deterministic preprocessing** — all media handling (download,
+          frame extraction, transcription) is deterministic infrastructure.
+          The only non-deterministic step is the LLM inference itself.
       tags: [Subagents]
       requestBody:
         required: true
@@ -238,55 +279,105 @@ paths:
             schema:
               $ref: '#/components/schemas/OneShotRequest'
             examples:
-              classification:
-                summary: Quick classification call (text only)
+              text_classification:
+                summary: "Text only — single-word classification"
                 value:
-                  prompt: "Classify this customer message as refund-request, complaint, or other. Respond with one word: 'refund is unacceptable, want my money back'."
+                  prompt: "Classify this customer message as refund-request, complaint, or other. Respond with one word only: 'refund is unacceptable, I want my money back'."
                   model: "gpt-4o-mini"
                   max_tokens: 10
-              vision_judgment:
-                summary: Vision-based judgment with Claude
+              text_summarization:
+                summary: "Text only — summarization with Anthropic"
                 value:
-                  prompt: "Does this screenshot show a login form or a dashboard?"
-                  model: "claude-3-5-sonnet-latest"
+                  prompt: "Summarize the EU AI Act high-risk criteria in 3 bullets."
+                  model: "claude-sonnet-4-20250514"
+                  max_tokens: 300
+              image_analysis:
+                summary: "Image — UI screenshot judgment"
+                value:
+                  prompt: "Does this screenshot show a login form or a dashboard? Describe the key UI elements you see and their layout."
+                  model: "claude-sonnet-4-20250514"
                   media:
                     - url: "https://example.com/screenshot.png"
                       type: "image/png"
-              anthropic_text:
-                summary: Plain text call to Anthropic
-                value:
-                  prompt: "Summarize the EU AI Act high-risk criteria in 3 bullets."
-                  model: "claude-3-5-sonnet-latest"
-                  max_tokens: 300
+                  max_tokens: 500
               video_analysis:
-                summary: Video analysis with Claude
+                summary: "Video — deep analysis of a YouTube video"
                 value:
-                  prompt: "What are the key topics discussed in this video?"
-                  model: "claude-sonnet-4-20250514"
+                  prompt: |
+                    Review this video and provide:
+                    1. A one-paragraph summary of the overall topic
+                    2. A timestamped list of each distinct topic or segment discussed, with the approximate time range and a brief description
+                    3. Any tools, products, or technologies mentioned by name
+                    4. Key claims or recommendations made by the presenter
+                    5. Whether the presenter demonstrates anything on screen — if so, describe what is shown and at what timestamps
+                  model: "gpt-4o-mini"
                   media:
-                    - url: "https://www.youtube.com/watch?v=abc123"
+                    - url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
                       type: "video/mp4"
                   max_tokens: 4096
+              multi_image_comparison:
+                summary: "Multiple images — before/after comparison"
+                value:
+                  prompt: "Compare these two screenshots. What changed between the before and after? List every visible difference."
+                  model: "gpt-4o-mini"
+                  media:
+                    - url: "https://example.com/before.png"
+                      type: "image/png"
+                    - url: "https://example.com/after.png"
+                      type: "image/png"
+                  max_tokens: 1024
       responses:
         '200':
-          description: Completion returned.
+          description: |
+            LLM completion returned. The `text` field contains the model's
+            response. The `tokens` object reports usage. The `model` field
+            is the exact model identifier the provider reported (which may
+            differ from the requested model due to aliasing). The `provider`
+            field confirms which provider handled the call.
           content:
             application/json:
               schema:
                 $ref: '#/components/schemas/OneShotResponse'
               examples:
-                openai:
-                  summary: OpenAI response
+                text_response:
+                  summary: "Text classification result"
                   value:
-                    text: "refund"
+                    text: "refund-request"
                     tokens: { input: 42, output: 1, total: 43 }
+                    model: "gpt-4o-mini-2024-07-18"
+                    provider: "openai"
+                video_response:
+                  summary: "Video analysis result"
+                  value:
+                    text: |
+                      ## Summary
+                      The video is a walkthrough of building a video analysis skill for AI assistants using yt-dlp and ffmpeg...
+
+                      ## Timestamped Segments
+                      - **0:00–1:30** — Introduction and motivation for the project
+                      - **1:30–4:00** — Setting up yt-dlp and ffmpeg locally
+                      - **4:00–7:15** — Frame extraction strategy and cost optimization
+                      - **7:15–9:00** — Whisper transcription fallback
+                      - **9:00–10:30** — Live demo and results
+
+                      ## Tools & Technologies Mentioned
+                      - yt-dlp, ffmpeg, Whisper, Claude, OpenAI API
+
+                      ## Key Claims
+                      - Frame capping keeps token cost flat regardless of video length
+                      - Free YouTube captions eliminate the need for paid transcription in most cases
+
+                      ## On-Screen Demonstrations
+                      - **4:15** — Terminal showing ffmpeg frame extraction command
+                      - **8:30** — Side-by-side of extracted frames and transcript alignment
+                    tokens: { input: 52215, output: 847, total: 53062 }
                     model: "gpt-4o-mini-2024-07-18"
                     provider: "openai"
         '400':
           description: |
             Missing `prompt`, missing API key for the inferred provider,
             unsupported model, invalid video URL (`invalid_video_url`), or
-            video exceeds max duration (`video_too_long`).
+            video exceeds max duration of 4 hours (`video_too_long`).
         '401':
           $ref: '#/components/responses/Unauthorized'
         '422':
@@ -1117,13 +1208,19 @@ components:
       type: object
       required: [prompt]
       description: |
-        Request body for the embedded-agent one-shot endpoint. A direct LLM call —
-        no ReAct, no tools, no threads.
+        Input to the multimodal agent node. Supports text-only, text +
+        images, text + video, or any combination. The agent node handles
+        all media preprocessing — the caller sends a prompt and URLs,
+        the node returns structured inference output.
       properties:
         prompt:
           type: string
-          description: The text the LLM should respond to.
-          example: "Classify this as refund or complaint: 'my order never arrived'."
+          description: |
+            The instruction or question for the LLM. For text-only calls,
+            this is the complete input. For multimodal calls, this is the
+            question or task the model should perform on the provided media.
+            Be specific — the more precise the prompt, the better the result.
+          example: "Review this video and list the key topics discussed, with approximate timestamps."
         model:
           type: string
           nullable: true
@@ -1172,7 +1269,10 @@ components:
     OneShotResponse:
       type: object
       required: [text, tokens, model, provider]
-      description: Response from the one-shot embedded-agent endpoint.
+      description: |
+        Output from the multimodal agent node. Contains the LLM's response
+        text, token usage, the exact model identifier reported by the
+        provider, and which provider handled the call.
       properties:
         text:
           type: string
