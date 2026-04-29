@@ -11,6 +11,7 @@ import { join } from 'path';
 import { connectDB } from './lib/db';
 import { subagentsRouter } from './routes/subagents';
 import { notificationsRouter } from './routes/notifications';
+import { videoRouter } from './routes/video';
 
 const app = new Hono();
 
@@ -39,6 +40,7 @@ app.get('/v1/openapi.yaml', (c) => {
 // ── Routes ──────────────────────────────────────────────────────────────────
 app.route('/v1/subagents', subagentsRouter);
 app.route('/v1/notifications', notificationsRouter);
+app.route('/v1/video', videoRouter);
 
 // ── 404 fallthrough ─────────────────────────────────────────────────────────
 app.notFound((c) => c.json({ error: 'Not found' }, 404));

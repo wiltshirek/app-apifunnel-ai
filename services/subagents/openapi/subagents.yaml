@@ -62,6 +62,13 @@ tags:
       Observability and communication endpoints for dispatched subagents. Subagent lifecycle
       (create, cancel) is managed by top-level platform tools — this API provides read-only
       status, result retrieval, and follow-up messaging.
+  - name: Video
+    description: |
+      Deterministic video utility endpoints. Pure infrastructure — no LLM, no
+      reasoning, no inference. These endpoints handle video download, caption
+      extraction, and transcription as standalone operations. Use them directly
+      when you need video data without an agent opinion, or let the agent node
+      (`/subagents/one-shot`) call them internally for full multimodal analysis.
   - name: Notifications
     description: |
       Generic, source-agnostic notification service backed by Firestore. Any event source
@@ -762,6 +769,107 @@ paths:
                 task_id: "sa_1711234567_abc123"
                 status: "running"
 
+  # ── Video ──
+
+  /video/transcript:
+    get:
+      operationId: getVideoTranscript
+      summary: Extract timestamped transcript from a video URL
+      description: |
+        **Pure infrastructure — no LLM involved.** Extracts a timestamped
+        transcript from a YouTube video URL. Returns the transcript as
+        plain text with `HH:MM:SS` timestamps.
+
+        ### How it works
+
+        1. Probes the video for metadata (duration, availability)
+        2. Attempts to pull embedded captions from the video source
+        3. If no captions are available, falls back to Whisper speech-to-text
+           transcription (Groq first, then OpenAI)
+        4. Returns the timestamped transcript with source metadata
+
+        ### When to use this vs the agent node
+
+        - **This endpoint** — You need the raw transcript text. No reasoning,
+          no summarization, no analysis. Fast, cheap, deterministic.
+        - **`POST /subagents/one-shot`** — You need an LLM to reason over the
+          video content (summarize, analyze, extract insights, answer questions).
+          The agent node calls this transcript logic internally as part of its
+          video preprocessing pipeline.
+
+        ### Cost
+
+        - **Captions available**: Near-zero. Just an HTTP call to YouTube.
+          No video download, no Whisper API call.
+        - **Whisper fallback**: Requires downloading the video and calling the
+          Whisper API. Server-supplied keys — no cost to the caller.
+      tags: [Video]
+      parameters:
+        - name: url
+          in: query
+          required: true
+          description: |
+            YouTube video URL. Supports standard watch URLs, short URLs
+            (`youtu.be/...`), and Shorts URLs.
+          schema:
+            type: string
+          examples:
+            standard:
+              value: "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+              summary: Standard YouTube watch URL
+            short:
+              value: "https://youtu.be/dQw4w9WgXcQ"
+              summary: Short URL format
+      responses:
+        '200':
+          description: Transcript extracted successfully.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TranscriptResponse'
+              examples:
+                captions:
+                  summary: Transcript from embedded captions
+                  value:
+                    url: "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+                    source: "captions"
+                    duration_seconds: 212
+                    transcript: |
+                      00:00:00 We're no strangers to love
+                      00:00:03 You know the rules and so do I
+                      00:00:07 A full commitment's what I'm thinking of
+                      00:00:10 You wouldn't get this from any other guy
+                whisper:
+                  summary: Transcript from Whisper fallback
+                  value:
+                    url: "https://www.youtube.com/watch?v=example123"
+                    source: "whisper"
+                    duration_seconds: 516
+                    transcript: |
+                      00:00:00 Hey everyone, welcome back to the channel.
+                      00:00:04 Today we're going to look at how to build
+                      00:00:07 a video analysis pipeline using yt-dlp and ffmpeg.
+        '400':
+          description: |
+            Missing `url` query parameter (`missing_url`), invalid URL format
+            (`invalid_video_url`), or video exceeds 4-hour max (`video_too_long`).
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '422':
+          description: |
+            Video is unavailable (`video_unavailable`) — private, deleted, or
+            geo-restricted. Or no transcript source available
+            (`transcript_unavailable`) — no captions and no Whisper key configured.
+        '502':
+          description: |
+            Whisper transcription failed (`transcript_failed`) or video
+            processing failed (`video_processing_failed`).
+        '504':
+          description: |
+            Video download timed out (`video_timeout`).
+
+  # ── Notifications ──
+
   /notifications:
     post:
       operationId: pushNotification
@@ -1303,6 +1411,41 @@ components:
         provider:
           type: string
           enum: [openai, anthropic, google]
+
+    TranscriptResponse:
+      type: object
+      required: [url, source, duration_seconds, transcript]
+      description: |
+        Timestamped transcript extracted from a video. The `source` field
+        indicates whether the transcript came from embedded captions (free,
+        fast) or Whisper speech-to-text (requires video download + API call).
+      properties:
+        url:
+          type: string
+          description: The video URL that was processed.
+          example: "https://www.youtube.com/watch?v=dQw4w9WgXcQ"
+        source:
+          type: string
+          enum: [captions, whisper]
+          description: |
+            Where the transcript came from:
+            - `captions` — Embedded or auto-generated captions from the video source.
+              Fast and free.
+            - `whisper` — Speech-to-text transcription via Whisper API (Groq or OpenAI).
+              Requires downloading the video audio. Used when captions are unavailable.
+        duration_seconds:
+          type: number
+          description: Video duration in seconds.
+          example: 516
+        transcript:
+          type: string
+          description: |
+            Timestamped transcript. Each line starts with `HH:MM:SS` followed
+            by the spoken text at that timestamp. Lines are separated by newlines.
+          example: |
+            00:00:00 Hey everyone, welcome back to the channel.
+            00:00:04 Today we're going to look at how to build
+            00:00:07 a video analysis pipeline using yt-dlp.
 
     SendMessageRequest:
       type: object

@@ -31,6 +31,11 @@ const MAX_DURATION_SECONDS = 4 * 60 * 60; // 4 hours
 const DOWNLOAD_TIMEOUT_MS = 10 * 60 * 1000; // 10 min
 const FFMPEG_TIMEOUT_MS = 5 * 60 * 1000; // 5 min
 
+function proxyArgs(): string[] {
+  const url = process.env.PROXY_URL;
+  return url ? ['--proxy', url] : [];
+}
+
 const VIDEO_HOST_PATTERNS = [
   /youtube\.com\/watch/i,
   /youtu\.be\//i,
@@ -79,6 +84,7 @@ async function probeDuration(url: string): Promise<number> {
     const { stdout } = await execFileAsync('yt-dlp', [
       '--dump-json', '--no-download', '--no-warnings',
       '--extractor-args', 'youtube:player_client=mediaconnect',
+      ...proxyArgs(),
       url,
     ], { timeout: 60_000 });
     const info = JSON.parse(stdout);
@@ -102,6 +108,7 @@ async function downloadVideo(url: string, tmpDir: string): Promise<string> {
       '--no-playlist',
       '--no-warnings',
       '--extractor-args', 'youtube:player_client=mediaconnect',
+      ...proxyArgs(),
       url,
     ], { timeout: DOWNLOAD_TIMEOUT_MS });
   } catch (err: any) {
@@ -133,6 +140,7 @@ async function extractCaptions(url: string, tmpDir: string): Promise<string | nu
       '-o', join(tmpDir, 'subs'),
       '--no-warnings',
       '--extractor-args', 'youtube:player_client=mediaconnect',
+      ...proxyArgs(),
       url,
     ], { timeout: 60_000 });
   } catch {
@@ -297,6 +305,62 @@ async function callWhisperApi(
   }
 
   return data.text ?? '';
+}
+
+export interface TranscriptResult {
+  url: string;
+  source: 'captions' | 'whisper';
+  duration_seconds: number;
+  transcript: string;
+}
+
+/**
+ * Extract transcript only — no video download, no frames, no LLM.
+ * Tries embedded captions first, falls back to Whisper if keys are available.
+ */
+export async function extractTranscript(url: string): Promise<TranscriptResult> {
+  validateUrl(url);
+
+  console.log(`[video/transcript] start url=${url}`);
+  const start = Date.now();
+
+  const duration = await probeDuration(url);
+  if (duration > MAX_DURATION_SECONDS) {
+    throw new LlmError(400, 'video_too_long', `Video duration ${duration}s exceeds maximum ${MAX_DURATION_SECONDS}s.`);
+  }
+
+  const tmpDir = await mkdtemp(join(tmpdir(), 'transcript-'));
+
+  try {
+    const captionText = await extractCaptions(url, tmpDir);
+    if (captionText) {
+      console.log(`[video/transcript] captions found length=${captionText.length} elapsed=${Date.now() - start}ms`);
+      return { url, source: 'captions', duration_seconds: duration, transcript: captionText };
+    }
+
+    console.log('[video/transcript] no captions, attempting Whisper fallback');
+
+    const groqKey = process.env.GROQ_API_KEY;
+    const openaiKey = process.env.WHISPER_OPENAI_API_KEY;
+    if (!groqKey && !openaiKey) {
+      throw new LlmError(422, 'transcript_unavailable', 'No captions found and no Whisper API key configured for fallback.');
+    }
+
+    const videoPath = await downloadVideo(url, tmpDir);
+    const whisperText = await transcribeWithWhisper(videoPath, tmpDir, {
+      groqApiKey: groqKey,
+      openaiWhisperKey: openaiKey,
+    });
+
+    if (!whisperText) {
+      throw new LlmError(502, 'transcript_failed', 'Whisper transcription returned no output.');
+    }
+
+    console.log(`[video/transcript] whisper done length=${whisperText.length} elapsed=${Date.now() - start}ms`);
+    return { url, source: 'whisper', duration_seconds: duration, transcript: whisperText };
+  } finally {
+    await rm(tmpDir, { recursive: true, force: true }).catch(() => {});
+  }
 }
 
 export async function preprocessVideo(
