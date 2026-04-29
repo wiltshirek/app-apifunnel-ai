@@ -1,0 +1,6 @@
+{
+  "private": true,
+  "scripts": {
+    "dev": "cd services/subagents && npm run dev"
+  }
+}

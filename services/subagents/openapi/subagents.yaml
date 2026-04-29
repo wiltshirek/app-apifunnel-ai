@@ -219,6 +219,17 @@ paths:
 
         The caller's JWT must carry `api_settings.<provider>.api_key` for the
         inferred provider, or the endpoint returns 400.
+
+        **Video support:** When `media[].type` starts with `video/` or
+        `media[].url` matches a known video host (YouTube), the server
+        automatically runs a video preprocessing pipeline: download via yt-dlp,
+        extract frames via ffmpeg, pull captions (or transcribe via Whisper),
+        then build a multimodal prompt with interleaved frames and transcript.
+        The caller's contract is unchanged — prompt + URL in, analysis out.
+
+        Whisper transcription keys (Groq, OpenAI) are server-supplied. The
+        caller does not need to provide them. The LLM model key for the
+        analysis call still comes from the caller's `api_settings`.
       tags: [Subagents]
       requestBody:
         required: true
@@ -247,6 +258,15 @@ paths:
                   prompt: "Summarize the EU AI Act high-risk criteria in 3 bullets."
                   model: "claude-3-5-sonnet-latest"
                   max_tokens: 300
+              video_analysis:
+                summary: Video analysis with Claude
+                value:
+                  prompt: "What are the key topics discussed in this video?"
+                  model: "claude-sonnet-4-20250514"
+                  media:
+                    - url: "https://www.youtube.com/watch?v=abc123"
+                      type: "video/mp4"
+                  max_tokens: 4096
       responses:
         '200':
           description: Completion returned.
@@ -265,13 +285,28 @@ paths:
         '400':
           description: |
             Missing `prompt`, missing API key for the inferred provider,
-            or unsupported model.
+            unsupported model, invalid video URL (`invalid_video_url`), or
+            video exceeds max duration (`video_too_long`).
         '401':
           $ref: '#/components/responses/Unauthorized'
+        '422':
+          description: |
+            Video is unavailable (`video_unavailable`) — private, deleted, or
+            geo-restricted. Or no transcript source available
+            (`transcript_unavailable`).
         '429':
           description: Upstream provider rate limit.
         '500':
           description: Upstream provider or internal error.
+        '502':
+          description: |
+            Video processing failed (`video_processing_failed`) — ffmpeg or
+            yt-dlp returned an error. Or Whisper transcription failed
+            (`transcript_failed`).
+        '504':
+          description: |
+            Video pipeline timed out (`video_timeout`) — download or frame
+            extraction exceeded the time limit.
 
   /subagents/{id}:
     get:
@@ -1100,18 +1135,27 @@ components:
         media:
           type: array
           nullable: true
-          description: Optional media attachments (images for vision-capable models).
+          description: |
+            Optional media attachments. `image/*` types are passed directly to
+            the LLM provider for vision analysis. `video/*` types (or YouTube
+            URLs) trigger the server-side video pipeline: download, frame
+            extraction, transcript pull, and multimodal prompt construction.
           items:
             type: object
             required: [url, type]
             properties:
               url:
                 type: string
-                description: Publicly-reachable URL of the media file.
+                description: |
+                  Publicly-reachable URL. For images, passed directly to the
+                  provider. For video, the server downloads and preprocesses it.
                 example: "https://example.com/screenshot.png"
               type:
                 type: string
-                description: MIME type. Must start with `image/` for vision calls in v1.
+                description: |
+                  MIME type. `image/*` for vision, `video/*` for video analysis.
+                  For known video hosts (YouTube), the URL pattern is also used
+                  for detection regardless of this field.
                 example: "image/png"
         temperature:
           type: number

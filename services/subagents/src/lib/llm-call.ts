@@ -5,14 +5,21 @@
  * provider from the model id (or an explicit override), call the provider's
  * HTTP API directly via fetch, and return structured JSON.
  *
- * Zero new npm deps — everything goes through fetch.
+ * Video media: when a video URL is detected in `media`, the video pipeline
+ * (video.ts) extracts frames + transcript, then multimodal.ts builds the
+ * provider-specific content array. Whisper keys are server-supplied env vars.
+ *
+ * Zero new npm deps — everything goes through fetch + child_process.
  */
+
+import { isVideoUrl, preprocessVideo } from './video';
+import { buildMultimodalContent } from './multimodal';
 
 export type Provider = 'openai' | 'anthropic' | 'google';
 
 export interface Media {
   url: string;
-  type: string; // "image/png", "image/jpeg", etc.
+  type: string; // "image/png", "image/jpeg", "video/mp4", etc.
 }
 
 export interface OneShotOptions {
@@ -49,6 +56,18 @@ export async function oneShotCompletion(opts: OneShotOptions): Promise<OneShotRe
     throw new LlmError(400, 'missing_api_key', `No API key for provider "${provider}" in user api_settings.`);
   }
 
+  const videoMedia = opts.media?.find(m => isVideoUrl(m.url, m.type));
+  if (videoMedia) {
+    const { frames, transcript } = await preprocessVideo(videoMedia.url);
+    const multimodalContent = buildMultimodalContent(opts.prompt, frames, transcript, provider);
+    const videoMaxTokens = opts.max_tokens ?? 4096;
+
+    if (provider === 'openai') return callOpenAI(apiKey, model, opts, multimodalContent, videoMaxTokens);
+    if (provider === 'anthropic') return callAnthropic(apiKey, model, opts, multimodalContent, videoMaxTokens);
+    if (provider === 'google') return callGoogle(apiKey, model, opts, multimodalContent, videoMaxTokens);
+    throw new LlmError(400, 'unknown_provider', `Cannot infer provider for model "${model}".`);
+  }
+
   if (provider === 'openai') return callOpenAI(apiKey, model, opts);
   if (provider === 'anthropic') return callAnthropic(apiKey, model, opts);
   if (provider === 'google') return callGoogle(apiKey, model, opts);
@@ -73,9 +92,14 @@ function getProviderKey(settings: Record<string, any>, provider: Provider): stri
 
 // ─── OpenAI ──────────────────────────────────────────────────────────────────
 
-async function callOpenAI(apiKey: string, model: string, opts: OneShotOptions): Promise<OneShotResult> {
+async function callOpenAI(
+  apiKey: string, model: string, opts: OneShotOptions,
+  videoContent?: any[], videoMaxTokens?: number,
+): Promise<OneShotResult> {
   const messages: any[] = [];
-  if (opts.media && opts.media.length > 0) {
+  if (videoContent) {
+    messages.push({ role: 'user', content: videoContent });
+  } else if (opts.media && opts.media.length > 0) {
     const content: any[] = [{ type: 'text', text: opts.prompt }];
     for (const m of opts.media) {
       content.push({ type: 'image_url', image_url: { url: m.url } });
@@ -87,8 +111,10 @@ async function callOpenAI(apiKey: string, model: string, opts: OneShotOptions): 
 
   const body: any = { model, messages };
   if (opts.temperature != null) body.temperature = opts.temperature;
-  if (opts.max_tokens != null) body.max_tokens = opts.max_tokens;
+  const effectiveMaxTokens = videoMaxTokens ?? opts.max_tokens;
+  if (effectiveMaxTokens != null) body.max_tokens = effectiveMaxTokens;
 
+  const timeout = videoContent ? 300_000 : 120_000;
   const res = await fetch('https://api.openai.com/v1/chat/completions', {
     method: 'POST',
     headers: {
@@ -96,7 +122,7 @@ async function callOpenAI(apiKey: string, model: string, opts: OneShotOptions): 
       'Authorization': `Bearer ${apiKey}`,
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(120_000),
+    signal: AbortSignal.timeout(timeout),
   });
 
   if (!res.ok) {
@@ -126,27 +152,36 @@ async function callOpenAI(apiKey: string, model: string, opts: OneShotOptions): 
 
 // ─── Anthropic ───────────────────────────────────────────────────────────────
 
-async function callAnthropic(apiKey: string, model: string, opts: OneShotOptions): Promise<OneShotResult> {
-  const content: any[] = [];
-  if (opts.media && opts.media.length > 0) {
-    for (const m of opts.media) {
-      if (m.type.startsWith('image/')) {
-        content.push({
-          type: 'image',
-          source: { type: 'url', url: m.url },
-        });
+async function callAnthropic(
+  apiKey: string, model: string, opts: OneShotOptions,
+  videoContent?: any[], videoMaxTokens?: number,
+): Promise<OneShotResult> {
+  let content: any[];
+  if (videoContent) {
+    content = videoContent;
+  } else {
+    content = [];
+    if (opts.media && opts.media.length > 0) {
+      for (const m of opts.media) {
+        if (m.type.startsWith('image/')) {
+          content.push({
+            type: 'image',
+            source: { type: 'url', url: m.url },
+          });
+        }
       }
     }
+    content.push({ type: 'text', text: opts.prompt });
   }
-  content.push({ type: 'text', text: opts.prompt });
 
   const body: any = {
     model,
     messages: [{ role: 'user', content }],
-    max_tokens: opts.max_tokens ?? 1024,
+    max_tokens: videoMaxTokens ?? opts.max_tokens ?? 1024,
   };
   if (opts.temperature != null) body.temperature = opts.temperature;
 
+  const timeout = videoContent ? 300_000 : 120_000;
   const res = await fetch('https://api.anthropic.com/v1/messages', {
     method: 'POST',
     headers: {
@@ -155,7 +190,7 @@ async function callAnthropic(apiKey: string, model: string, opts: OneShotOptions
       'anthropic-version': '2023-06-01',
     },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(120_000),
+    signal: AbortSignal.timeout(timeout),
   });
 
   if (!res.ok) {
@@ -182,32 +217,42 @@ async function callAnthropic(apiKey: string, model: string, opts: OneShotOptions
 
 // ─── Google Gemini ───────────────────────────────────────────────────────────
 
-async function callGoogle(apiKey: string, model: string, opts: OneShotOptions): Promise<OneShotResult> {
-  const parts: any[] = [{ text: opts.prompt }];
-  if (opts.media && opts.media.length > 0) {
-    for (const m of opts.media) {
-      if (m.type.startsWith('image/')) {
-        parts.push({
-          fileData: { mimeType: m.type, fileUri: m.url },
-        });
+async function callGoogle(
+  apiKey: string, model: string, opts: OneShotOptions,
+  videoContent?: any[], videoMaxTokens?: number,
+): Promise<OneShotResult> {
+  let parts: any[];
+  if (videoContent) {
+    parts = videoContent;
+  } else {
+    parts = [{ text: opts.prompt }];
+    if (opts.media && opts.media.length > 0) {
+      for (const m of opts.media) {
+        if (m.type.startsWith('image/')) {
+          parts.push({
+            fileData: { mimeType: m.type, fileUri: m.url },
+          });
+        }
       }
     }
   }
 
+  const effectiveMaxTokens = videoMaxTokens ?? opts.max_tokens;
   const body: any = {
     contents: [{ role: 'user', parts }],
     generationConfig: {
       ...(opts.temperature != null && { temperature: opts.temperature }),
-      ...(opts.max_tokens != null && { maxOutputTokens: opts.max_tokens }),
+      ...(effectiveMaxTokens != null && { maxOutputTokens: effectiveMaxTokens }),
     },
   };
 
+  const timeout = videoContent ? 300_000 : 120_000;
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(apiKey)}`;
   const res = await fetch(url, {
     method: 'POST',
     headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(body),
-    signal: AbortSignal.timeout(120_000),
+    signal: AbortSignal.timeout(timeout),
   });
 
   if (!res.ok) {
