@@ -145,7 +145,7 @@ jobs:
           SCP="scp -i ~/.ssh/key -o StrictHostKeyChecking=no -r"
 
           echo "📦 Installing video pipeline dependencies..."
-          $SSH "which yt-dlp >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq ffmpeg python3 curl && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod a+rx /usr/local/bin/yt-dlp)"
+          $SSH "which yt-dlp >/dev/null 2>&1 || (APT_LISTCHANGES_FRONTEND=none DEBIAN_FRONTEND=noninteractive apt-get update -o APT::Update::Post-Invoke-Success::=true 2>/dev/null; apt-get install -y --no-install-recommends ffmpeg python3 curl 2>/dev/null; curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod a+rx /usr/local/bin/yt-dlp)"
 
           echo "📦 Syncing subagents..."
           $SSH "mkdir -p /opt/api-apifunnel/services/subagents"
