@@ -131,6 +131,9 @@ jobs:
           REPO_SEARCH_S3_SECRET=${{ secrets.REPO_SEARCH_S3_SECRET }}
           REPO_SEARCH_S3_REGION=${{ secrets.REPO_SEARCH_S3_REGION }}
           REPO_SEARCH_S3_BUCKET=apifunnel-repo-vectors
+
+          GROQ_API_KEY=${{ secrets.GROQ_API_KEY }}
+          WHISPER_OPENAI_API_KEY=${{ secrets.WHISPER_OPENAI_API_KEY }}
           ENVEOF"
 
           echo "✅ .env written"
@@ -140,6 +143,9 @@ jobs:
         run: |
           SSH="ssh -i ~/.ssh/key -o StrictHostKeyChecking=no root@$NODE_IP"
           SCP="scp -i ~/.ssh/key -o StrictHostKeyChecking=no -r"
+
+          echo "📦 Installing video pipeline dependencies..."
+          $SSH "which yt-dlp >/dev/null 2>&1 || (apt-get update -qq && apt-get install -y -qq ffmpeg python3 curl && curl -L https://github.com/yt-dlp/yt-dlp/releases/latest/download/yt-dlp -o /usr/local/bin/yt-dlp && chmod a+rx /usr/local/bin/yt-dlp)"
 
           echo "📦 Syncing subagents..."
           $SSH "mkdir -p /opt/api-apifunnel/services/subagents"
