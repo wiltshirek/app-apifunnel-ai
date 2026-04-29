@@ -203,17 +203,27 @@ paths:
       operationId: oneShotAgent
       summary: Multimodal agent node — stateless, single-turn LLM inference over text, images, and video
       description: |
-        **Embedded agent node for multimodal inference.** This endpoint is a
-        composable, stateless building block that any orchestrator, workflow,
-        or agent graph can invoke as a single node. It accepts a prompt with
-        optional media (text, images, video, or any combination), executes
-        one LLM inference turn, and returns a structured result.
+        **Multimodal agent node for on-demand inference.** This endpoint is
+        a stateless, composable unit of LLM inference. It accepts a prompt
+        with optional media (text, images, video, or any combination),
+        executes one LLM turn, and returns a structured result.
 
-        As an agent node, it is designed to be dropped into any agentic
-        pipeline — reasoning graphs, DAGs, ReAct loops, or simple
-        sequential chains — wherever a single-turn LLM judgment is needed.
-        It owns no state, manages no threads, and has no side effects. The
-        orchestrator controls sequencing, branching, and memory.
+        It works in two modes:
+
+        - **Standalone / on-demand** — Call it directly for real-time,
+          interactive inference. A user pastes a YouTube URL and asks
+          "what is this video about?" — the response comes back in seconds.
+          No workflow, no orchestration, no setup. Single-shot inference
+          whenever you need it.
+
+        - **Embedded in workflows** — Drop it into any agentic pipeline,
+          reasoning graph, DAG, or sequential chain as a single inference
+          node. The orchestrator controls sequencing, branching, and memory.
+          This node owns no state and has no side effects — it just
+          executes one turn and returns.
+
+        Either way, the contract is the same: prompt in, structured
+        result out.
 
         ### Supported modalities
 
@@ -264,10 +274,12 @@ paths:
         ### Agent node characteristics
 
         - **Stateless** — no threads, no memory, no task rows. Every call
-          is independent.
+          is independent. No setup, no teardown.
         - **Synchronous** — the response is returned in the same HTTP call.
-        - **Composable** — can be invoked from any orchestrator, workflow
-          engine, or agent framework as a single inference step.
+          Real-time, interactive use is a first-class use case.
+        - **Composable** — can be invoked standalone or embedded in any
+          orchestrator, workflow engine, or agent framework as a single
+          inference step.
         - **Deterministic preprocessing** — all media handling (download,
           frame extraction, transcription) is deterministic infrastructure.
           The only non-deterministic step is the LLM inference itself.
