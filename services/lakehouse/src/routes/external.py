@@ -530,9 +530,9 @@ async def api_text(asset_id: str, request: Request):
     if not asset:
         return JSONResponse({"error": "Asset not found"}, status_code=404)
 
-    text = asset.get("extracted_text")
+    text = (asset.get("extracted_text") or "").strip()
     if not text:
-        return JSONResponse({"error": "No extracted text available for this asset"}, status_code=400)
+        return JSONResponse({"error": "No extracted text available for this asset. The file may be a scanned document that requires OCR re-processing — try re-uploading."}, status_code=400)
 
     return JSONResponse({
         "asset_id": asset_id,

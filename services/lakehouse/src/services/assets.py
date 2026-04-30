@@ -112,9 +112,30 @@ async def _extract_pdf_text(file_bytes: bytes) -> Dict[str, Any]:
         import fitz
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         pages = []
+        needs_ocr = False
+
         for i, page in enumerate(doc):
             text = page.get_text()
+            if not text.strip():
+                needs_ocr = True
             pages.append({"num": i + 1, "text": text, "char_count": len(text)})
+
+        if needs_ocr:
+            logger.info("PDF has %d blank page(s), attempting OCR...", sum(1 for p in pages if not p["text"].strip()))
+            ocr_pages = []
+            for i, page in enumerate(doc):
+                if pages[i]["text"].strip():
+                    ocr_pages.append(pages[i])
+                    continue
+                try:
+                    tp = page.get_textpage_ocr(language="eng", dpi=300, full=True)
+                    text = page.get_text(textpage=tp)
+                    ocr_pages.append({"num": i + 1, "text": text, "char_count": len(text)})
+                except Exception as ocr_exc:
+                    logger.warning("OCR failed on page %d: %s", i + 1, ocr_exc)
+                    ocr_pages.append(pages[i])
+            pages = ocr_pages
+
         page_count = len(doc)
         doc.close()
         return {

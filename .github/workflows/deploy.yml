@@ -167,6 +167,9 @@ jobs:
           SSH="ssh -i ~/.ssh/key -o StrictHostKeyChecking=no root@$NODE_IP"
           SCP="scp -i ~/.ssh/key -o StrictHostKeyChecking=no -r"
 
+          echo "📦 Installing OCR dependencies..."
+          $SSH "which tesseract >/dev/null 2>&1 || (APT_LISTCHANGES_FRONTEND=none DEBIAN_FRONTEND=noninteractive apt-get update -o APT::Update::Post-Invoke-Success::=true 2>/dev/null; apt-get install -y --no-install-recommends tesseract-ocr 2>/dev/null)"
+
           echo "📦 Syncing lakehouse..."
           $SSH "mkdir -p /opt/api-apifunnel/services/lakehouse"
           $SCP services/lakehouse/pyproject.toml "root@$NODE_IP:/opt/api-apifunnel/services/lakehouse/"

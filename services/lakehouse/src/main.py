@@ -47,6 +47,7 @@ app = FastAPI(
 
 _DEFAULT_ORIGINS = [
     "https://app.apifunnel.ai",
+    "https://app-apifunnel-ai.ngrok.io",
     "http://localhost:3000",
     "http://localhost:4000",
 ]
