@@ -34,7 +34,12 @@ api.apifunnel.ai {
 
     # ── Subagents (Node :3001) ────────────────────────────────────
     handle /v1/* {
-        reverse_proxy localhost:3001
+        reverse_proxy localhost:3001 {
+            transport http {
+                read_timeout 300s
+                write_timeout 300s
+            }
+        }
     }
 
     # ── Graphiti adapter (optional, :8001) ────────────────────────
