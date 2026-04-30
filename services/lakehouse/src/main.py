@@ -45,12 +45,17 @@ app = FastAPI(
     lifespan=lifespan,
 )
 
+_DEFAULT_ORIGINS = [
+    "https://app.apifunnel.ai",
+    "http://localhost:3000",
+    "http://localhost:4000",
+]
+_extra = os.environ.get("CORS_EXTRA_ORIGINS", "")
+_origins = _DEFAULT_ORIGINS + [o.strip() for o in _extra.split(",") if o.strip()]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        "https://app.apifunnel.ai",
-        "http://localhost:3000",
-    ],
+    allow_origins=_origins,
     allow_methods=["*"],
     allow_headers=["*"],
 )
