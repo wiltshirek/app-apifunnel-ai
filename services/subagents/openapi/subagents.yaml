@@ -3,12 +3,14 @@ info:
   title: Agent Nodes & Infrastructure API
   version: 1.0.0
   description: |
-    Stateless LLM inference primitives, image generation, video analysis,
-    autonomous agent dispatch, and inter-agent notifications.
+    AITL (AI Tool Layer) agent node primitives: stateless LLM inference,
+    image generation, video analysis, autonomous agent dispatch, and
+    inter-agent notifications.
 
     ## Overview
 
-    This API is the platform's inference and agent infrastructure layer. It covers:
+    This API is the platform's AITL (AI Tool Layer) — the agent node
+    infrastructure. It covers:
 
     - **Agent nodes** — Stateless, single-turn LLM inference endpoints that accept
       a prompt (with optional media) and return structured output. Use them standalone
@@ -71,13 +73,13 @@ security:
 tags:
   - name: Subagents
     description: |
-      Agent nodes and autonomous agent infrastructure. Includes stateless LLM inference
-      primitives (one-shot multimodal analysis, image generation from text prompts),
-      autonomous ReAct agent dispatch and observability, and follow-up messaging.
-      Agent nodes are composable building blocks for on-demand inference — text
-      classification, summarization, image analysis, video analysis, image creation,
-      and any single-turn LLM task. Autonomous agents run long-running multi-turn
-      reasoning loops with tools.
+      AITL agent nodes and autonomous agent infrastructure. Includes stateless
+      LLM inference primitives (one-shot multimodal analysis, image generation
+      from text prompts), autonomous ReAct agent dispatch and observability, and
+      follow-up messaging. Agent nodes are composable building blocks for
+      on-demand inference — text classification, summarization, image analysis,
+      video analysis, image creation, and any single-turn LLM task. Autonomous
+      agents run long-running multi-turn reasoning loops with tools.
   - name: Video
     description: |
       Deterministic video utility endpoints. Pure infrastructure — no LLM, no
