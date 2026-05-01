@@ -4,6 +4,7 @@ Binaries stored in Hetzner S3, metadata + extracted text in MongoDB `assets` col
 Full-text search via MongoDB text index on `extracted_text`.
 """
 
+import asyncio
 import base64
 import hashlib
 import io
@@ -107,34 +108,29 @@ async def _generate_thumbnail(file_bytes: bytes, content_type: str) -> Optional[
         return None
 
 
-async def _extract_pdf_text(file_bytes: bytes) -> Dict[str, Any]:
+async def _extract_pdf_text(file_bytes: bytes, *, run_ocr: bool = False) -> Dict[str, Any]:
     try:
         import fitz
         doc = fitz.open(stream=file_bytes, filetype="pdf")
         pages = []
-        needs_ocr = False
 
         for i, page in enumerate(doc):
             text = page.get_text()
-            if not text.strip():
-                needs_ocr = True
             pages.append({"num": i + 1, "text": text, "char_count": len(text)})
 
-        if needs_ocr:
-            logger.info("PDF has %d blank page(s), attempting OCR...", sum(1 for p in pages if not p["text"].strip()))
-            ocr_pages = []
-            for i, page in enumerate(doc):
-                if pages[i]["text"].strip():
-                    ocr_pages.append(pages[i])
-                    continue
-                try:
-                    tp = page.get_textpage_ocr(language="eng", dpi=300, full=True)
-                    text = page.get_text(textpage=tp)
-                    ocr_pages.append({"num": i + 1, "text": text, "char_count": len(text)})
-                except Exception as ocr_exc:
-                    logger.warning("OCR failed on page %d: %s", i + 1, ocr_exc)
-                    ocr_pages.append(pages[i])
-            pages = ocr_pages
+        if run_ocr:
+            blank_count = sum(1 for p in pages if not p["text"].strip())
+            if blank_count:
+                logger.info("PDF has %d blank page(s), running OCR...", blank_count)
+                for i, page in enumerate(doc):
+                    if pages[i]["text"].strip():
+                        continue
+                    try:
+                        tp = page.get_textpage_ocr(language="eng", dpi=300, full=True)
+                        text = page.get_text(textpage=tp)
+                        pages[i] = {"num": i + 1, "text": text, "char_count": len(text)}
+                    except Exception as ocr_exc:
+                        logger.warning("OCR failed on page %d: %s", i + 1, ocr_exc)
 
         page_count = len(doc)
         doc.close()
@@ -146,6 +142,31 @@ async def _extract_pdf_text(file_bytes: bytes) -> Dict[str, Any]:
     except Exception as exc:
         logger.error("PDF text extraction failed: %s", exc)
         return {"page_count": 0, "pages": [], "full_text": ""}
+
+
+async def _extract_pdf_background(db, asset_id: str, file_bytes: bytes) -> None:
+    """Fire-and-forget: extract text (+ OCR if needed) and patch the asset doc."""
+    try:
+        pdf = await _extract_pdf_text(file_bytes, run_ocr=True)
+        document_metadata = {
+            "page_count": pdf["page_count"],
+            "pages": [{"num": p["num"], "char_count": p["char_count"]} for p in pdf["pages"]],
+        }
+        extracted_text = pdf["full_text"]
+        page_text_store = {str(p["num"]): p["text"] for p in pdf["pages"]}
+
+        await db.assets.update_one(
+            {"_id": asset_id},
+            {"$set": {
+                "document": document_metadata,
+                "extracted_text": extracted_text,
+                "page_texts": page_text_store,
+                "updated_at": datetime.utcnow(),
+            }},
+        )
+        logger.info("PDF text extraction complete for %s (%d pages)", asset_id, pdf["page_count"])
+    except Exception as exc:
+        logger.error("Background PDF extraction failed for %s: %s", asset_id, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -181,16 +202,8 @@ async def upload_asset(
         if await upload_file(io.BytesIO(thumb_bytes), thumb_key, "image/png", {"asset_id": asset_id, "type": "thumbnail"}):
             thumbnail_s3_key = thumb_key
 
-    document_metadata = None
     extracted_text = None
-    page_text_store = None
-
-    if content_type == "application/pdf":
-        pdf = await _extract_pdf_text(file_bytes)
-        document_metadata = {"page_count": pdf["page_count"], "pages": [{"num": p["num"], "char_count": p["char_count"]} for p in pdf["pages"]]}
-        extracted_text = pdf["full_text"]
-        page_text_store = {str(p["num"]): p["text"] for p in pdf["pages"]}
-    elif _is_text_type(content_type):
+    if _is_text_type(content_type):
         try:
             extracted_text = file_bytes.decode("utf-8")
         except UnicodeDecodeError:
@@ -207,9 +220,7 @@ async def upload_asset(
         "checksum_sha256": checksum,
         "s3_key": s3_key,
         "thumbnail_s3_key": thumbnail_s3_key,
-        "document": document_metadata,
         "extracted_text": extracted_text,
-        "page_texts": page_text_store,
         "processing_status": "complete",
         "created_at": now,
         "updated_at": now,
@@ -222,6 +233,9 @@ async def upload_asset(
         asset_doc["client_meta"] = client_meta
 
     await db.assets.insert_one(asset_doc)
+
+    if content_type == "application/pdf":
+        asyncio.create_task(_extract_pdf_background(db, asset_id, file_bytes))
 
     thumbnail_url = None
     if thumbnail_s3_key:
@@ -434,30 +448,18 @@ async def update_asset(
         if await upload_file(io.BytesIO(thumb_bytes), thumb_key, "image/png", {"asset_id": asset_id, "type": "thumbnail"}):
             thumbnail_s3_key = thumb_key
 
-    document_metadata = existing.get("document")
     extracted_text = existing.get("extracted_text")
-    page_text_store = existing.get("page_texts")
 
     if content_type == "application/pdf":
-        pdf = await _extract_pdf_text(file_bytes)
-        document_metadata = {
-            "page_count": pdf["page_count"],
-            "pages": [{"num": p["num"], "char_count": p["char_count"]} for p in pdf["pages"]],
-        }
-        extracted_text = pdf["full_text"]
-        page_text_store = {str(p["num"]): p["text"] for p in pdf["pages"]}
+        extracted_text = None
     elif _is_text_type(content_type):
         try:
             extracted_text = file_bytes.decode("utf-8")
         except UnicodeDecodeError:
             extracted_text = None
-        document_metadata = None
-        page_text_store = None
     else:
         if existing.get("content_type") == "application/pdf":
-            document_metadata = None
             extracted_text = None
-            page_text_store = None
 
     now = datetime.utcnow()
     updates: Dict[str, Any] = {
@@ -466,13 +468,17 @@ async def update_asset(
         "size_bytes": len(file_bytes),
         "checksum_sha256": checksum,
         "thumbnail_s3_key": thumbnail_s3_key,
-        "document": document_metadata,
         "extracted_text": extracted_text,
-        "page_texts": page_text_store,
         "updated_at": now,
     }
+    if content_type == "application/pdf":
+        updates["document"] = None
+        updates["page_texts"] = None
 
     await db.assets.update_one({"_id": asset_id}, {"$set": updates})
+
+    if content_type == "application/pdf":
+        asyncio.create_task(_extract_pdf_background(db, asset_id, file_bytes))
 
     thumbnail_url = None
     if thumbnail_s3_key:
