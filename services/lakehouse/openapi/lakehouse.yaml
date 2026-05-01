@@ -499,12 +499,19 @@ paths:
             enum: [pdf, pages, auto]
             default: auto
           description: Output format (auto selects best format for the content type)
+        - name: page
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+          description: Start page (1-indexed) for the rendering window
         - name: max_pages
           in: query
           schema:
             type: integer
             default: 5
-          description: Maximum number of pages to return for multi-page documents
+          description: Maximum number of pages to return starting from the page param
       responses:
         '200':
           description: Asset content for vision analysis

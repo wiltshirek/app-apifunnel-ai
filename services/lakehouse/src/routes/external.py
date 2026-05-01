@@ -392,6 +392,7 @@ async def api_view(asset_id: str, request: Request):
     ct = asset.get("content_type", "")
     filename = asset.get("filename", "")
     max_pages = int(request.query_params.get("max_pages", "5"))
+    page = int(request.query_params.get("page", "1"))
 
     is_dxf = ct in ("application/dxf", "application/acad", "image/vnd.dxf") or \
              filename.lower().endswith(".dxf")
@@ -463,10 +464,11 @@ async def api_view(asset_id: str, request: Request):
             import fitz
             doc = fitz.open(stream=file_bytes, filetype="pdf")
             pages = []
-            for i, page in enumerate(doc):
-                if i >= max_pages:
-                    break
-                pix = page.get_pixmap(dpi=150)
+            start = max(page - 1, 0)
+            end = min(start + max_pages, len(doc))
+            for i in range(start, end):
+                pg = doc[i]
+                pix = pg.get_pixmap(dpi=150)
                 pages.append({
                     "page": i + 1,
                     "base64": base64.b64encode(pix.tobytes("png")).decode(),
