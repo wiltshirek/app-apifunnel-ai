@@ -1,13 +1,19 @@
 # Video Analysis
 
-The subagents service supports multimodal video analysis through two endpoints: a **transcript extraction** endpoint (pure infrastructure, no LLM) and the **one-shot agent node** (LLM-powered analysis of video content).
+The **video-edit** service (port 3005) handles all video processing: editing, composition, analysis, and transcript extraction. It was extracted from the subagents service into its own standalone API.
+
+**OpenAPI spec**: `https://api.apifunnel.ai/v1/video/openapi.yaml` (or `http://localhost:3005/v1/openapi.yaml` locally)
 
 ## Endpoints
 
 | Endpoint | Purpose | LLM required? |
 |---|---|---|
 | `GET /v1/video/transcript?url=<url>` | Extract timestamped transcript from a video | No |
-| `POST /v1/subagents/one-shot` | Analyze video with an LLM (frames + transcript + prompt) | Yes |
+| `POST /v1/video/analyze` | Analyze any video URL with an LLM (frames + transcript + question) | Yes |
+| `POST /v1/video/assets/prepare` | Prepare images/PDFs/video for composition | No |
+| `POST /v1/video/renders/compose` | Insert assets into a source video (fullscreen, PIP, overlay) | No |
+| `POST /v1/video/renders/:id/review` | LLM review of a completed render | Yes |
+| `GET /v1/video/jobs/:id` | Poll async job status | No |
 
 ### GET /v1/video/transcript
 

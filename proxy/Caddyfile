@@ -32,6 +32,20 @@ api.apifunnel.ai {
         reverse_proxy localhost:3004
     }
 
+    # ── Video Edit (Node :3005) ─────────────────────────────────
+    handle /api/v1/video {
+        reverse_proxy localhost:3005
+    }
+    handle /api/v1/video/* {
+        reverse_proxy localhost:3005
+    }
+    handle /v1/video {
+        reverse_proxy localhost:3005
+    }
+    handle /v1/video/* {
+        reverse_proxy localhost:3005
+    }
+
     # ── Subagents (Node :3001) ────────────────────────────────────
     handle /v1/* {
         reverse_proxy localhost:3001 {
@@ -63,6 +77,10 @@ api.apifunnel.ai {
     handle /health/reposearch {
         rewrite * /health
         reverse_proxy localhost:3004
+    }
+    handle /health/video-edit {
+        rewrite * /health
+        reverse_proxy localhost:3005
     }
 
     # ── Catch-all → subagents (historical default for bare paths) ─

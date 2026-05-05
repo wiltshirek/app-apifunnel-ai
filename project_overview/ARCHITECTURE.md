@@ -2,13 +2,14 @@
 
 ## Services
 
-| Service | Stack | Port |
-|---|---|---|
-| Subagents | Node.js (Hono) | 3001 | Requires `yt-dlp`, `ffmpeg`, `python3` for video pipeline |
-| Lakehouse | Python (FastAPI) | 3002 |
-| PR Bot | Python (FastAPI) | 3003 |
-| Repo Search | Python (FastAPI) | 3004 |
-| Caddy (proxy) | — | 80/443 |
+| Service | Stack | Port | Notes |
+|---|---|---|---|
+| Subagents | Node.js (Hono) | 3001 | Subagent orchestration, notifications, one-shot LLM |
+| Lakehouse | Python (FastAPI) | 3002 | |
+| PR Bot | Python (FastAPI) | 3003 | |
+| Repo Search | Python (FastAPI) | 3004 | |
+| Video Edit | Node.js (Hono) | 3005 | Requires `yt-dlp`, `ffmpeg`, `poppler-utils`, `python3` |
+| Caddy (proxy) | — | 80/443 | |
 
 ## Routing
 
@@ -20,8 +21,9 @@ All traffic enters through Caddy at `api.apifunnel.ai`.
 | `/internal/assets/*` | Lakehouse :3002 | Caddy rewrites to `/api/v1/assets/*` before hitting FastAPI |
 | `/api/v1/prbot/*` | PR Bot :3003 | |
 | `/api/v1/repo-search/*` | Repo Search :3004 | |
-| `/v1/video/*` | Subagents :3001 | Video transcript extraction (no LLM) |
-| `/v1/*` | Subagents :3001 | Includes one-shot agent node (multimodal: text, image, video) |
+| `/api/v1/video/*` | Video Edit :3005 | Video editing, composition, analysis, transcript |
+| `/v1/video/*` | Video Edit :3005 | Same service, alternate path prefix |
+| `/v1/*` | Subagents :3001 | Subagent orchestration, notifications, one-shot LLM |
 | `/graphiti/*` | Graphiti :8001 | Strip-prefix rewrite |
 | `/health/lakehouse` | Lakehouse :3002 | Rewrites to `/health` |
 | Everything else | Subagents :3001 | |

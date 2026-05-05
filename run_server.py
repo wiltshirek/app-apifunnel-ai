@@ -5,6 +5,10 @@ Usage:
     python3 run_server.py              # lakehouse (default)
     python3 run_server.py lakehouse    # lakehouse on :3002
     python3 run_server.py prbot        # prbot on :3003
+
+Node services (not managed by this script):
+    cd services/subagents && npm run dev   # subagents on :3001
+    cd services/video-edit && npm run dev  # video-edit on :3005
 """
 
 import os

@@ -4,14 +4,15 @@ Step-by-step guide for adding a new standalone REST API service to the platform.
 
 ## 1. Pick a Port and Name
 
-| Existing | Port |
-|----------|------|
-| subagents | 3001 |
-| lakehouse | 3002 |
-| prbot | 3003 |
-| reposearch | 3004 |
+| Existing | Port | Stack |
+|----------|------|-------|
+| subagents | 3001 | Node.js (Hono) |
+| lakehouse | 3002 | Python (FastAPI) |
+| prbot | 3003 | Python (FastAPI) |
+| reposearch | 3004 | Python (FastAPI) |
+| video-edit | 3005 | Node.js (Hono) |
 
-Next available: **3005**. Name should be short, lowercase, no hyphens (used as PM2 process name and directory name).
+Next available: **3006**. Name should be short, lowercase, no hyphens (used as PM2 process name and directory name).
 
 ## 2. Create the Service Directory
 
