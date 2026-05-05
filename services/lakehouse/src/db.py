@@ -44,7 +44,32 @@ async def get_db() -> AsyncIOMotorDatabase:
 
     await _client.admin.command("ping")
     logger.info("Connected to MongoDB (database: %s)", db_name)
+
+    await _ensure_indexes(_db)
     return _db
+
+
+async def _ensure_indexes(db: AsyncIOMotorDatabase) -> None:
+    coll = db.assets
+    await coll.create_index(
+        [("user_id", 1), ("created_at", -1)],
+        name="user_id_created_at",
+    )
+    await coll.create_index(
+        [("user_id", 1), ("tags", 1)],
+        name="user_id_tags",
+    )
+    await coll.create_index(
+        [("session_id", 1), ("is_ephemeral", 1)],
+        name="session_id_ephemeral",
+        partialFilterExpression={"session_id": {"$exists": True}},
+    )
+    await coll.create_index(
+        [("extracted_text", "text"), ("filename", "text")],
+        name="text_search",
+        default_language="english",
+    )
+    logger.info("Ensured indexes on assets collection")
 
 
 async def close_db() -> None:

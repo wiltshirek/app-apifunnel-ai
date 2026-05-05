@@ -9,4 +9,5 @@ Reference docs for AI agents working in this repo.
 | [OPERATIONS.md](OPERATIONS.md) | Deploy, Caddy, PM2, GitHub secrets, PR Bot gotchas, test token minting |
 | [PRBOT_SERVICE.md](PRBOT_SERVICE.md) | PR Bot service: architecture, routes, auth, deploy, env vars |
 | [ADDING_NEW_SERVICES.md](ADDING_NEW_SERVICES.md) | Step-by-step guide: how to add a new API server to the platform |
+| [VIDEO_ANALYSIS.md](VIDEO_ANALYSIS.md) | Video analysis pipeline: endpoints, proxy setup, Whisper, error codes |
 | [TESTING.md](TESTING.md) | How to run the endpoint test harnesses for each service |

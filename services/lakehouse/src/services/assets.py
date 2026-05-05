@@ -9,6 +9,7 @@ import base64
 import hashlib
 import io
 import logging
+import os
 from datetime import datetime
 from typing import Any, Dict, List, Optional
 
@@ -740,6 +741,198 @@ async def create_code_script_asset(
         "source": "code_execution_script",
         "created_at": now.isoformat(),
         "evicted_asset_ids": evicted,
+    }
+
+
+def _resolve_provider_key(api_settings: Optional[Dict[str, Any]], provider: str) -> Optional[str]:
+    """Extract an API key from the JWT's api_settings for a given provider."""
+    if not api_settings:
+        return None
+    bucket = api_settings.get(provider) or api_settings.get(provider.upper())
+    if not bucket:
+        return None
+    if isinstance(bucket, str):
+        return bucket
+    return bucket.get("api_key") or bucket.get("apiKey") or bucket.get("key")
+
+
+async def _generate_image_background(
+    db,
+    asset_id: str,
+    user_id: str,
+    api_key: str,
+    prompt: str,
+    size: str,
+    quality: str,
+    output_format: str,
+) -> None:
+    """Fire-and-forget: call OpenAI image generation, upload result to S3, update asset doc."""
+    import httpx
+    from ..storage.s3 import upload_file
+
+    try:
+        async with httpx.AsyncClient(timeout=httpx.Timeout(180.0)) as client:
+            resp = await client.post(
+                "https://api.openai.com/v1/images/generations",
+                headers={
+                    "Content-Type": "application/json",
+                    "Authorization": f"Bearer {api_key}",
+                },
+                json={
+                    "model": "gpt-image-2",
+                    "prompt": prompt,
+                    "size": size,
+                    "quality": quality,
+                    "output_format": output_format,
+                },
+            )
+
+        if resp.status_code != 200:
+            err_body = resp.json() if resp.headers.get("content-type", "").startswith("application/json") else {}
+            err_msg = err_body.get("error", {}).get("message", resp.text[:200])
+            logger.error("Image generation failed for %s: %s", asset_id, err_msg)
+            await db.assets.update_one(
+                {"_id": asset_id},
+                {"$set": {
+                    "processing_status": "failed",
+                    "processing_error": err_msg,
+                    "updated_at": datetime.utcnow(),
+                }},
+            )
+            return
+
+        data = resp.json()
+        b64 = data.get("data", [{}])[0].get("b64_json")
+        if not b64:
+            logger.error("No image data returned for %s", asset_id)
+            await db.assets.update_one(
+                {"_id": asset_id},
+                {"$set": {
+                    "processing_status": "failed",
+                    "processing_error": "No image data in API response",
+                    "updated_at": datetime.utcnow(),
+                }},
+            )
+            return
+
+        file_bytes = base64.b64decode(b64)
+        ext = output_format
+        s3_key = f"{user_id}/{asset_id}/original.{ext}"
+        content_type = f"image/{ext}"
+
+        ok = await upload_file(
+            io.BytesIO(file_bytes), s3_key, content_type,
+            {"asset_id": asset_id, "user_id": user_id, "source": "image_generation"},
+        )
+        if not ok:
+            logger.error("S3 upload failed for generated image %s", asset_id)
+            await db.assets.update_one(
+                {"_id": asset_id},
+                {"$set": {
+                    "processing_status": "failed",
+                    "processing_error": "S3 upload failed",
+                    "updated_at": datetime.utcnow(),
+                }},
+            )
+            return
+
+        thumbnail_s3_key = None
+        thumb_bytes = await _generate_thumbnail(file_bytes, content_type)
+        if thumb_bytes:
+            thumb_key = f"{user_id}/{asset_id}/thumb.png"
+            if await upload_file(io.BytesIO(thumb_bytes), thumb_key, "image/png", {"asset_id": asset_id, "type": "thumbnail"}):
+                thumbnail_s3_key = thumb_key
+
+        revised_prompt = data.get("data", [{}])[0].get("revised_prompt")
+
+        now = datetime.utcnow()
+        updates: Dict[str, Any] = {
+            "s3_key": s3_key,
+            "content_type": content_type,
+            "size_bytes": len(file_bytes),
+            "checksum_sha256": hashlib.sha256(file_bytes).hexdigest(),
+            "processing_status": "complete",
+            "updated_at": now,
+        }
+        if thumbnail_s3_key:
+            updates["thumbnail_s3_key"] = thumbnail_s3_key
+        if revised_prompt:
+            updates["revised_prompt"] = revised_prompt
+
+        await db.assets.update_one({"_id": asset_id}, {"$set": updates})
+        logger.info("Image generation complete for %s (%d bytes)", asset_id, len(file_bytes))
+
+    except Exception as exc:
+        logger.error("Background image generation failed for %s: %s", asset_id, exc)
+        await db.assets.update_one(
+            {"_id": asset_id},
+            {"$set": {
+                "processing_status": "failed",
+                "processing_error": str(exc),
+                "updated_at": datetime.utcnow(),
+            }},
+        )
+
+
+async def generate_image_asset(
+    db,
+    user_id: str,
+    prompt: str,
+    api_settings: Optional[Dict[str, Any]] = None,
+    size: str = "1024x1024",
+    quality: str = "high",
+    output_format: str = "png",
+    tenant_id: Optional[str] = None,
+    subagent_task_id: Optional[str] = None,
+    scheduled_task_id: Optional[str] = None,
+    client_meta: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Create a placeholder asset doc and kick off image generation in the background.
+
+    Returns immediately with asset_id + status=generating. The caller polls
+    GET /api/v1/assets/{asset_id} until processing_status flips to 'complete'.
+    """
+    api_key = _resolve_provider_key(api_settings, "openai") or os.environ.get("WHISPER_OPENAI_API_KEY")
+    if not api_key:
+        return {"error": "No OpenAI API key available", "code": "missing_api_key"}
+
+    asset_id = _generate_asset_id()
+    now = datetime.utcnow()
+
+    filename = f"generated_{asset_id}.{output_format}"
+
+    asset_doc: Dict[str, Any] = {
+        "_id": asset_id,
+        "user_id": user_id,
+        "tenant_id": tenant_id,
+        "filename": filename,
+        "content_type": f"image/{output_format}",
+        "size_bytes": 0,
+        "source": "image_generation",
+        "source_prompt": prompt,
+        "source_params": {"size": size, "quality": quality, "output_format": output_format},
+        "processing_status": "generating",
+        "created_at": now,
+        "updated_at": now,
+    }
+    if subagent_task_id:
+        asset_doc["subagent_task_id"] = subagent_task_id
+    if scheduled_task_id:
+        asset_doc["scheduled_task_id"] = scheduled_task_id
+    if client_meta:
+        asset_doc["client_meta"] = client_meta
+
+    await db.assets.insert_one(asset_doc)
+
+    asyncio.create_task(_generate_image_background(
+        db, asset_id, user_id, api_key, prompt, size, quality, output_format,
+    ))
+
+    return {
+        "asset_id": asset_id,
+        "filename": filename,
+        "status": "generating",
+        "message": "Image generation started. Poll GET /api/v1/assets/{asset_id} for status.",
     }
 
 

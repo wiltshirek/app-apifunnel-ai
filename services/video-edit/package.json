@@ -1,0 +1,28 @@
+{
+  "name": "video-edit-api",
+  "version": "1.0.0",
+  "description": "Video editing, composition, and multimodal analysis API",
+  "main": "dist/index.js",
+  "scripts": {
+    "dev": "tsx watch src/index.ts",
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint src --ext .ts"
+  },
+  "dependencies": {
+    "@aws-sdk/client-s3": "^3.1042.0",
+    "@aws-sdk/s3-request-presigner": "^3.1042.0",
+    "@hono/node-server": "^1.13.7",
+    "dotenv": "^17.4.1",
+    "hono": "^4.6.5",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.13.1"
+  },
+  "devDependencies": {
+    "@types/jsonwebtoken": "^9.0.9",
+    "@types/node": "^22.13.13",
+    "tsx": "^4.19.3",
+    "typescript": "^5.8.2"
+  }
+}

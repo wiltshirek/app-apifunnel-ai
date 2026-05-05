@@ -28,6 +28,7 @@ from ..services.assets import (
     delete_asset,
     delete_session_ephemerals,
     detect_content_type,
+    generate_image_asset,
     get_asset,
     list_assets,
     persist_session_artifact,
@@ -241,6 +242,43 @@ async def api_code_script(request: Request):
     if result.get("error"):
         return JSONResponse(result, status_code=500)
     return JSONResponse(result)
+
+
+@router.post("/generate-image")
+async def api_generate_image(request: Request):
+    """Generate an image from a text prompt (async, fire-and-forget).
+
+    Creates a placeholder asset immediately and kicks off OpenAI gpt-image-2
+    generation in the background. Poll GET /api/v1/assets/{asset_id} until
+    processing_status flips from 'generating' to 'complete'.
+    """
+    ident = await require_identity(request)
+
+    body = await request.json()
+    prompt = body.get("prompt")
+    if not prompt or not isinstance(prompt, str):
+        return JSONResponse({"error": "A prompt is required."}, status_code=400)
+
+    db = await get_db()
+    result = await generate_image_asset(
+        db,
+        user_id=ident.user_id,
+        prompt=prompt,
+        api_settings=ident.api_settings,
+        size=body.get("size", "1024x1024"),
+        quality=body.get("quality", "high"),
+        output_format=body.get("output_format", "png"),
+        tenant_id=ident.tenant_id,
+        subagent_task_id=ident.subagent_task_id,
+        scheduled_task_id=ident.scheduled_task_id,
+        client_meta=ident.client_meta,
+    )
+
+    if result.get("error"):
+        status = 400 if result.get("code") == "missing_api_key" else 500
+        return JSONResponse(result, status_code=status)
+
+    return JSONResponse(result, status_code=202)
 
 
 @router.delete("/session/{session_id}")

@@ -30,6 +30,16 @@ services:
     env_file: .env
     restart: unless-stopped
 
+  video-edit:
+    build: services/video-edit
+    ports:
+      - "3005:3005"
+    env_file: .env
+    environment:
+      PORT: "3005"
+      NODE_ENV: development
+    restart: unless-stopped
+
   caddy:
     image: caddy:2-alpine
     ports:
@@ -41,4 +51,5 @@ services:
       - lakehouse
       - prbot
       - reposearch
+      - video-edit
     restart: unless-stopped

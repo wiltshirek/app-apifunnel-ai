@@ -5,8 +5,15 @@
  * provider from the model id (or an explicit override), call the provider's
  * HTTP API directly via fetch, and return structured JSON.
  *
- * Video/multimodal analysis has moved to the video-edit service.
+ * Video media: when a video URL is detected in `media`, the video pipeline
+ * (video.ts) extracts frames + transcript, then multimodal.ts builds the
+ * provider-specific content array. Whisper keys are server-supplied env vars.
+ *
+ * Zero new npm deps — everything goes through fetch + child_process.
  */
+
+import { isVideoUrl, preprocessVideo } from './video';
+import { buildMultimodalContent } from './multimodal';
 
 export type Provider = 'openai' | 'anthropic' | 'google';
 
@@ -47,6 +54,18 @@ export async function oneShotCompletion(opts: OneShotOptions): Promise<OneShotRe
   const apiKey = getProviderKey(opts.api_settings, provider);
   if (!apiKey) {
     throw new LlmError(400, 'missing_api_key', `No API key for provider "${provider}" in user api_settings.`);
+  }
+
+  const videoMedia = opts.media?.find(m => isVideoUrl(m.url, m.type));
+  if (videoMedia) {
+    const { frames, transcript } = await preprocessVideo(videoMedia.url);
+    const multimodalContent = buildMultimodalContent(opts.prompt, frames, transcript, provider);
+    const videoMaxTokens = opts.max_tokens ?? 4096;
+
+    if (provider === 'openai') return callOpenAI(apiKey, model, opts, multimodalContent, videoMaxTokens);
+    if (provider === 'anthropic') return callAnthropic(apiKey, model, opts, multimodalContent, videoMaxTokens);
+    if (provider === 'google') return callGoogle(apiKey, model, opts, multimodalContent, videoMaxTokens);
+    throw new LlmError(400, 'unknown_provider', `Cannot infer provider for model "${model}".`);
   }
 
   if (provider === 'openai') return callOpenAI(apiKey, model, opts);

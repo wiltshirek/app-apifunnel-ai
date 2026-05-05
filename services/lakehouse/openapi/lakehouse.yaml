@@ -148,6 +148,38 @@ paths:
           description: Search results
         '401':
           description: Unauthorized
+    post:
+      operationId: search_assets_post
+      summary: Search assets (JSON body)
+      description: |
+        POST variant of asset search for agent/MCP callers that prefer
+        JSON request bodies over query parameters. Same underlying search.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - query
+              properties:
+                query:
+                  type: string
+                  description: Full-text search query
+                content_type:
+                  type: string
+                  description: Filter by content type
+                limit:
+                  type: integer
+                  default: 20
+                  maximum: 100
+      responses:
+        '200':
+          description: Search results
+        '400':
+          description: Missing required field query
+        '401':
+          description: Unauthorized
 
   /api/v1/assets/upload:
     post:
@@ -295,6 +327,97 @@ paths:
         '401':
           description: Unauthorized
 
+  /api/v1/assets/generate-image:
+    post:
+      operationId: generate_image_asset
+      summary: Generate an image from a text prompt (async)
+      description: |
+        Creates a placeholder asset immediately and kicks off image generation
+        (OpenAI gpt-image-2) in the background. Returns 202 with an `asset_id`
+        and `status: "generating"`.
+
+        ### Checking status
+
+        Use `GET /api/v1/assets/{asset_id}` to check progress. The
+        `processing_status` field transitions through:
+
+        - `"generating"` — image generation is in progress.
+        - `"complete"` — done. Use `/view`, `/download`, or `/bytes` to
+          retrieve the image.
+        - `"failed"` — generation failed. The `processing_error` field
+          contains the reason.
+
+        ### Multi-tasking guidance
+
+        Image generation typically takes 15–60 seconds. The assistant should
+        treat this as a background operation and continue working on other
+        parts of the user's request rather than blocking on a polling loop.
+        Come back to check the asset status after completing other pending
+        work, or when the user asks about the image. Avoid tight polling —
+        a single check after 30–60 seconds is usually sufficient.
+
+        ### Auth
+
+        The caller's JWT must carry `api_settings.openai.api_key`, or the
+        server falls back to `WHISPER_OPENAI_API_KEY` for local development.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - prompt
+              properties:
+                prompt:
+                  type: string
+                  description: Text description of the image to generate.
+                size:
+                  type: string
+                  enum: ["1024x1024", "1024x1536", "1536x1024"]
+                  default: "1024x1024"
+                quality:
+                  type: string
+                  enum: [low, medium, high]
+                  default: "high"
+                output_format:
+                  type: string
+                  enum: [png, webp, jpeg]
+                  default: "png"
+            examples:
+              simple:
+                summary: Simple image generation
+                value:
+                  prompt: "A watercolor painting of a mountain lake at sunrise"
+              detailed:
+                summary: With size, quality, and format options
+                value:
+                  prompt: "A minimalist line drawing of a cat sitting on a windowsill"
+                  size: "1024x1536"
+                  quality: "high"
+                  output_format: "png"
+      responses:
+        '202':
+          description: Image generation started. Poll the asset for completion.
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  asset_id: { type: string }
+                  filename: { type: string }
+                  status: { type: string, enum: [generating] }
+                  message: { type: string }
+              example:
+                asset_id: "ast_x7k2m9p4q1n3"
+                filename: "generated_ast_x7k2m9p4q1n3.png"
+                status: "generating"
+                message: "Image generation started. Poll GET /api/v1/assets/{asset_id} for status."
+        '400':
+          description: Missing prompt or no OpenAI API key available.
+        '401':
+          description: Unauthorized
+
   /api/v1/assets/session/{session_id}:
     delete:
       operationId: delete_session_ephemerals
@@ -335,6 +458,47 @@ paths:
         '401':
           description: Unauthorized
 
+  /api/v1/assets/ingest:
+    post:
+      operationId: ingest_asset_external
+      summary: Ingest asset from base64 content
+      description: |
+        Upload a file as base64-encoded JSON. This is the primary ingest path
+        for agents and code-execution containers that produce blobs in-memory
+        (as opposed to `upload` which accepts multipart form data).
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - filename
+                - base64_content
+              properties:
+                filename:
+                  type: string
+                  description: Display filename for the asset
+                base64_content:
+                  type: string
+                  description: Base64-encoded file bytes
+                tenant_id:
+                  type: string
+                  description: Optional tenant override (defaults to JWT tenant)
+      responses:
+        '200':
+          description: Asset ingested
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssetResult"
+        '400':
+          description: Missing filename or base64_content
+        '401':
+          description: Unauthorized
+        '500':
+          description: S3 upload failed
+
   /api/v1/assets/{asset_id}:
     get:
       operationId: get_asset_external
@@ -350,6 +514,55 @@ paths:
           description: Asset metadata
         '404':
           description: Not found
+    put:
+      operationId: update_asset_external
+      summary: Replace asset content in-place
+      description: |
+        Replace the stored bytes of an existing asset. The S3 object is
+        overwritten at the same key, metadata (content_type, size, checksum,
+        extracted_text) is refreshed, and thumbnails are regenerated. All
+        provenance metadata (created_at, user_id, session_id, tags, source)
+        is preserved. Use this to edit an asset's content without changing
+        its asset_id.
+      parameters:
+        - name: asset_id
+          in: path
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required:
+                - base64_content
+              properties:
+                base64_content:
+                  type: string
+                  description: Base64-encoded replacement file bytes
+                filename:
+                  type: string
+                  description: Optional new filename (keeps existing if omitted)
+                tenant_id:
+                  type: string
+                  description: Optional tenant override (defaults to JWT tenant)
+      responses:
+        '200':
+          description: Asset updated
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/AssetResult"
+        '400':
+          description: Missing or invalid base64_content
+        '401':
+          description: Unauthorized
+        '404':
+          description: Asset not found
+        '500':
+          description: S3 upload failed
     delete:
       operationId: delete_asset_external
       summary: Delete asset (external)
@@ -364,6 +577,40 @@ paths:
           description: Deleted
         '404':
           description: Not found
+
+  /api/v1/assets/{asset_id}/promote:
+    post:
+      operationId: promote_session_artifact
+      summary: Promote ephemeral session artifact to permanent
+      description: |
+        Remove ephemeral session metadata (`session_id`, `is_ephemeral`) from
+        an asset, making it a permanent user asset. Use this when a
+        code-execution session produces a file the user wants to keep beyond
+        the session lifecycle.
+      parameters:
+        - name: asset_id
+          in: path
+          required: true
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Asset promoted
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  success:
+                    type: boolean
+                  asset_id:
+                    type: string
+                  message:
+                    type: string
+        '401':
+          description: Unauthorized
+        '404':
+          description: Asset not found or already promoted
 
   /api/v1/assets/{asset_id}/download:
     get:
@@ -596,6 +843,42 @@ components:
         Service-to-service admin key (`MCP_ADMIN_KEY`). Optional.
         When present alongside `BearerAuth`, grants admin-level trust on
         top of the user JWT identity.
+
+  schemas:
+    AssetResult:
+      type: object
+      properties:
+        asset_id:
+          type: string
+        filename:
+          type: string
+        content_type:
+          type: string
+        size_bytes:
+          type: integer
+        checksum_sha256:
+          type: string
+        s3_key:
+          type: string
+        thumbnail_url:
+          type: string
+          nullable: true
+        snippet:
+          type: string
+          nullable: true
+          description: First ~200 chars of extracted text (text/PDF assets only)
+        tenant_id:
+          type: string
+          nullable: true
+        status:
+          type: string
+          enum: [complete]
+        updated_at:
+          type: string
+          format: date-time
+        page_count:
+          type: integer
+          description: Present only for PDF assets
 
 security:
   - BearerAuth: []

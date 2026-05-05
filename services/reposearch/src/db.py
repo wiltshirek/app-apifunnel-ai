@@ -38,6 +38,12 @@ async def get_db() -> AsyncIOMotorDatabase:
 
     await _client.admin.command("ping")
     logger.info("Connected to MongoDB (database: %s)", name)
+
+    await _db.repo_indexes.create_index(
+        [("repo", 1), ("branch", 1)],
+        name="repo_branch",
+    )
+    logger.info("Ensured indexes on repo_indexes collection")
     return _db
 
 

@@ -21,7 +21,7 @@ Secrets come from two `.env` files — not one:
 
 | Secret | Source |
 |---|---|
-| `MONGODB_URI`, `LAKEHOUSE_MONGODB_URI`, `JWT_SECRET`, `MCP_ADMIN_KEY`, `CRON_SECRET`, `FIREBASE_*`, `HETZNER_S3_*`, `APP_BASE_URL`, `GRAPHITI_SERVICE_URL` | This repo's `.env` |
+| `MONGODB_URI`, `LAKEHOUSE_MONGODB_URI`, `JWT_SECRET`, `MCP_ADMIN_KEY`, `CRON_SECRET`, `FIREBASE_*`, `HETZNER_S3_*`, `APP_BASE_URL`, `GRAPHITI_SERVICE_URL`, `GROQ_API_KEY`, `WHISPER_OPENAI_API_KEY`, `PROXY_URL` | This repo's `.env` |
 | `HETZNER_API_TOKEN` | `mcp-code-execution/.env` as `HETZNER_API_KEY` (different name, same value) |
 | `DEPLOY_SSH_KEY` | `mcp-code-execution/.env` as `WEBHOOK_SSH_PRIVATE_KEY` |
 
