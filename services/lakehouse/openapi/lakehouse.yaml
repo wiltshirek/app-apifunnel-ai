@@ -125,35 +125,59 @@ paths:
   /api/v1/assets/search:
     get:
       operationId: search_assets_external
-      summary: Search assets (external)
-      description: Full-text search via JWT authentication
+      summary: Semantic search across user assets
+      description: |
+        Hybrid semantic search combining vector similarity (OpenAI embeddings)
+        with BM25 keyword matching via MongoDB Atlas $rankFusion.
+
+        Provide a **natural language query** — this is a semantic search, not a
+        filename filter. The query is embedded and compared against document
+        content vectors, so phrases like "quarterly revenue breakdown" will
+        match financial documents even if those exact words do not appear in
+        the filename or body text. Keyword matches (filenames, product codes,
+        exact terms) are also included via the BM25 path and fused into a
+        single ranked result set.
+
+        Results are scoped to the authenticated user and ranked by combined
+        relevance across both semantic and keyword signals.
       parameters:
         - name: q
           in: query
           required: true
           schema:
             type: string
-          description: Search query
+          description: |
+            Natural language semantic search query. Describe what you are
+            looking for in plain language — e.g. "monthly expense reports",
+            "Stripe payout reconciliation", "project architecture diagrams".
         - name: content_type
           in: query
           schema:
             type: string
+          description: Filter results to a specific MIME type (e.g. application/pdf).
         - name: limit
           in: query
           schema:
             type: integer
             default: 20
+          description: Maximum number of results to return (max 100).
       responses:
         '200':
-          description: Search results
+          description: Ranked search results ordered by semantic + keyword relevance
         '401':
           description: Unauthorized
     post:
       operationId: search_assets_post
-      summary: Search assets (JSON body)
+      summary: Semantic search across user assets (JSON body)
       description: |
-        POST variant of asset search for agent/MCP callers that prefer
-        JSON request bodies over query parameters. Same underlying search.
+        POST variant of the semantic asset search for agent/MCP callers that
+        prefer JSON request bodies over query parameters. Same hybrid search
+        engine — combines vector similarity with BM25 keyword matching.
+
+        Provide a **natural language query** describing what you are looking
+        for. This is a semantic search: the query is embedded and compared
+        against document content, so synonyms and contextually similar
+        phrasing will match even without exact keyword overlap.
       requestBody:
         required: true
         content:
@@ -165,13 +189,18 @@ paths:
               properties:
                 query:
                   type: string
-                  description: Full-text search query
+                  description: |
+                    Natural language semantic search query. Describe what
+                    you are looking for in full sentences or phrases —
+                    e.g. "documents about payment processing",
+                    "tax filing paperwork from 2024".
                 content_type:
                   type: string
-                  description: Filter by content type
+                  description: Filter results to a specific MIME type.
                 limit:
                   type: integer
                   default: 20
+                  description: Maximum number of results (max 100).
                   maximum: 100
       responses:
         '200':

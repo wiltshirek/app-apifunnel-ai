@@ -90,6 +90,16 @@ Admin-key callers (the platform) don't carry `api_settings` — that's by design
 - The env var fallback is sufficient for local testing
 - In production, the platform mints a JWT with `api_settings` and sends that
 
+## Platform Infrastructure Keys
+
+Some OpenAI usage is platform infrastructure, not user-scoped. These keys live in the environment and are never read from JWT `api_settings`:
+
+| Env Var | Used By | Purpose |
+|---|---|---|
+| `OPENAI_API_KEY` | Lakehouse | Document & query embeddings for hybrid semantic search |
+
+Do not confuse this with `WHISPER_OPENAI_API_KEY` (user-scoped fallback for provider calls). Embedding costs are absorbed by the platform.
+
 ## Current Services Using This Pattern
 
 | Service | Provider Keys Used | Env Var Fallback |

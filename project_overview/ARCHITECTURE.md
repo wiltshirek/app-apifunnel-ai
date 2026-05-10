@@ -62,13 +62,50 @@ Lakehouse stores asset binaries in Hetzner Object Storage (S3-compatible). If S3
 
 Required env vars: `HETZNER_S3_ENDPOINT`, `HETZNER_S3_ACCESS_KEY`, `HETZNER_S3_SECRET`, `HETZNER_S3_REGION`, `HETZNER_S3_ASSETS_BUCKET`.
 
-## MongoDB Text Index (one-time, post-deploy)
+## MongoDB Search Indexes
 
-Lakehouse full-text search requires a text index. Run once after first deploy:
+Lakehouse hybrid search requires three indexes on the `assets` collection:
+
+1. **Legacy `$text` index** — created automatically by `db.py` at startup. Used as fallback when Atlas Search / Vector Search indexes are not yet available.
+
+2. **Atlas Vector Search index** (`assets_vector_search`) — stores embeddings for semantic search. Create via Atlas UI or Admin API:
 
 ```javascript
-use mcp_code_execution_server
-db.assets.createIndex({ extracted_text: "text" })
+// Index type: vectorSearch
+{
+  "name": "assets_vector_search",
+  "type": "vectorSearch",
+  "definition": {
+    "fields": [
+      { "path": "embedding", "type": "vector", "numDimensions": 1536, "similarity": "cosine" },
+      { "path": "user_id", "type": "filter" },
+      { "path": "tenant_id", "type": "filter" },
+      { "path": "content_type", "type": "filter" }
+    ]
+  }
+}
 ```
 
-Without this, search returns 500.
+3. **Atlas Search index** (`assets_text_search`) — BM25 keyword search. Create via Atlas UI or Admin API:
+
+```javascript
+// Index type: search
+{
+  "name": "assets_text_search",
+  "type": "search",
+  "definition": {
+    "mappings": {
+      "dynamic": false,
+      "fields": {
+        "extracted_text": { "type": "string", "analyzer": "lucene.standard" },
+        "filename": { "type": "string", "analyzer": "lucene.standard" },
+        "user_id": { "type": "token" },
+        "tenant_id": { "type": "token" },
+        "content_type": { "type": "token" }
+      }
+    }
+  }
+}
+```
+
+Both Atlas indexes must be created manually (they cannot be created via `create_index()`). The `$rankFusion` stage that combines them requires MongoDB 8.0+ and is currently a Preview feature. If these indexes are not present, search falls back to the legacy `$text` keyword path automatically.

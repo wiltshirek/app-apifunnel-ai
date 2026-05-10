@@ -1,7 +1,7 @@
 """Asset storage service — upload, retrieval, search, delete.
 
 Binaries stored in Hetzner S3, metadata + extracted text in MongoDB `assets` collection.
-Full-text search via MongoDB text index on `extracted_text`.
+Hybrid search via MongoDB Atlas $rankFusion (vector + BM25 keyword).
 """
 
 import asyncio
@@ -156,16 +156,25 @@ async def _extract_pdf_background(db, asset_id: str, file_bytes: bytes) -> None:
         extracted_text = pdf["full_text"]
         page_text_store = {str(p["num"]): p["text"] for p in pdf["pages"]}
 
+        from .embeddings import get_embedding
+
+        embedding = await get_embedding(extracted_text) if extracted_text else None
+
+        update_fields: Dict[str, Any] = {
+            "document": document_metadata,
+            "extracted_text": extracted_text,
+            "page_texts": page_text_store,
+            "updated_at": datetime.utcnow(),
+        }
+        if embedding is not None:
+            update_fields["embedding"] = embedding
+
         await db.assets.update_one(
             {"_id": asset_id},
-            {"$set": {
-                "document": document_metadata,
-                "extracted_text": extracted_text,
-                "page_texts": page_text_store,
-                "updated_at": datetime.utcnow(),
-            }},
+            {"$set": update_fields},
         )
-        logger.info("PDF text extraction complete for %s (%d pages)", asset_id, pdf["page_count"])
+        logger.info("PDF text extraction complete for %s (%d pages, embedding=%s)",
+                     asset_id, pdf["page_count"], "yes" if embedding else "no")
     except Exception as exc:
         logger.error("Background PDF extraction failed for %s: %s", asset_id, exc)
 
@@ -210,6 +219,10 @@ async def upload_asset(
         except UnicodeDecodeError:
             pass
 
+    from .embeddings import get_embedding
+
+    embedding = await get_embedding(extracted_text) if extracted_text else None
+
     now = datetime.utcnow()
     asset_doc: Dict[str, Any] = {
         "_id": asset_id,
@@ -226,6 +239,8 @@ async def upload_asset(
         "created_at": now,
         "updated_at": now,
     }
+    if embedding is not None:
+        asset_doc["embedding"] = embedding
     if subagent_task_id:
         asset_doc["subagent_task_id"] = subagent_task_id
     if scheduled_task_id:
@@ -369,6 +384,112 @@ async def search_assets(
     if not user_id:
         return []
     limit = min(limit, 100)
+
+    from .embeddings import get_embedding
+
+    query_embedding = await get_embedding(query_text)
+
+    if query_embedding is not None:
+        try:
+            return await _hybrid_search(
+                db, user_id, query_text, query_embedding,
+                content_type=content_type, tenant_id=tenant_id, limit=limit,
+            )
+        except Exception as exc:
+            logger.warning("Hybrid search failed, falling back to keyword: %s", exc)
+
+    return await _keyword_search(
+        db, user_id, query_text,
+        content_type=content_type, tenant_id=tenant_id, limit=limit,
+    )
+
+
+async def _hybrid_search(
+    db,
+    user_id: str,
+    query_text: str,
+    query_embedding: List[float],
+    content_type: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """Hybrid BM25 + vector search via $rankFusion (requires Atlas 8.0+)."""
+    vector_filter: Dict[str, Any] = {"user_id": user_id}
+    if tenant_id:
+        vector_filter["tenant_id"] = tenant_id
+    if content_type:
+        vector_filter["content_type"] = content_type
+
+    text_filter_clauses = [
+        {"equals": {"path": "user_id", "value": user_id}},
+    ]
+    if tenant_id:
+        text_filter_clauses.append({"equals": {"path": "tenant_id", "value": tenant_id}})
+    if content_type:
+        text_filter_clauses.append({"equals": {"path": "content_type", "value": content_type}})
+
+    pipeline = [
+        {
+            "$rankFusion": {
+                "input": {
+                    "pipelines": {
+                        "vector": [
+                            {
+                                "$vectorSearch": {
+                                    "index": "assets_vector_search",
+                                    "path": "embedding",
+                                    "queryVector": query_embedding,
+                                    "numCandidates": limit * 20,
+                                    "limit": limit,
+                                    "filter": vector_filter,
+                                }
+                            }
+                        ],
+                        "fulltext": [
+                            {
+                                "$search": {
+                                    "index": "assets_text_search",
+                                    "compound": {
+                                        "must": [
+                                            {
+                                                "text": {
+                                                    "query": query_text,
+                                                    "path": ["extracted_text", "filename"],
+                                                }
+                                            }
+                                        ],
+                                        "filter": text_filter_clauses,
+                                    }
+                                }
+                            },
+                            {"$limit": limit},
+                        ],
+                    }
+                },
+            }
+        },
+        {"$limit": limit},
+        {"$project": {
+            "_id": 1, "filename": 1, "content_type": 1, "size_bytes": 1,
+            "document.page_count": 1, "tenant_id": 1, "created_at": 1,
+            "score": {"$meta": "score"},
+            "snippet": {"$substrCP": [{"$ifNull": ["$extracted_text", ""]}, 0, 500]},
+        }},
+    ]
+
+    results = await db.assets.aggregate(pipeline).to_list(length=limit)
+    return _format_search_results(results)
+
+
+async def _keyword_search(
+    db,
+    user_id: str,
+    query_text: str,
+    content_type: Optional[str] = None,
+    tenant_id: Optional[str] = None,
+    limit: int = 20,
+) -> List[Dict[str, Any]]:
+    """Legacy $text keyword search — used as fallback when embedding or Atlas features are unavailable."""
     match: Dict[str, Any] = {"$text": {"$search": query_text}, "user_id": user_id}
     if content_type:
         match["content_type"] = content_type
@@ -390,9 +511,13 @@ async def search_assets(
     try:
         results = await db.assets.aggregate(pipeline).to_list(length=limit)
     except Exception as exc:
-        logger.error("Search failed: %s", exc)
+        logger.error("Keyword search failed: %s", exc)
         return []
 
+    return _format_search_results(results)
+
+
+def _format_search_results(results: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
     return [
         {
             "asset_id": r["_id"],
@@ -462,6 +587,10 @@ async def update_asset(
         if existing.get("content_type") == "application/pdf":
             extracted_text = None
 
+    from .embeddings import get_embedding
+
+    embedding = await get_embedding(extracted_text) if extracted_text else None
+
     now = datetime.utcnow()
     updates: Dict[str, Any] = {
         "filename": effective_filename,
@@ -472,6 +601,10 @@ async def update_asset(
         "extracted_text": extracted_text,
         "updated_at": now,
     }
+    if embedding is not None:
+        updates["embedding"] = embedding
+    elif extracted_text is None:
+        updates["embedding"] = None
     if content_type == "application/pdf":
         updates["document"] = None
         updates["page_texts"] = None
@@ -692,6 +825,10 @@ async def create_code_script_asset(
     if not ok:
         return {"error": "S3 upload failed", "asset_id": asset_id}
 
+    from .embeddings import get_embedding
+
+    embedding = await get_embedding(code) if code else None
+
     now = datetime.utcnow()
     doc: Dict[str, Any] = {
         "_id": asset_id,
@@ -709,6 +846,8 @@ async def create_code_script_asset(
         "created_at": now,
         "updated_at": now,
     }
+    if embedding is not None:
+        doc["embedding"] = embedding
     if client_meta:
         doc["client_meta"] = client_meta
 
