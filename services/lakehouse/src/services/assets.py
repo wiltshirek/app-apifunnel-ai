@@ -274,8 +274,6 @@ async def upload_asset(
         "thumbnail_url": thumbnail_url, "snippet": snippet, "tenant_id": tenant_id,
         "status": "complete", "created_at": now.isoformat(),
     }
-    if content_type == "application/pdf" and document_metadata:
-        resp["page_count"] = document_metadata["page_count"]
     if subagent_task_id:
         resp["subagent_task_id"] = subagent_task_id
     if scheduled_task_id:
@@ -642,8 +640,6 @@ async def update_asset(
         "status": "complete",
         "updated_at": now.isoformat(),
     }
-    if content_type == "application/pdf" and document_metadata:
-        resp["page_count"] = document_metadata["page_count"]
     return resp
 
 
