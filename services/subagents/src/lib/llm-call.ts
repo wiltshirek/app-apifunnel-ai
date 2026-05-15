@@ -196,6 +196,67 @@ async function callAnthropic(
   };
 }
 
+// ─── OpenAI Image Generation ─────────────────────────────────────────────────
+
+export interface ImageGenerationOptions {
+  prompt: string;
+  size?: string;
+  quality?: string;
+  output_format?: string;
+}
+
+export interface ImageGenerationResult {
+  base64: string;
+  content_type: string;
+  size_bytes: number;
+  revised_prompt?: string;
+  model: string;
+  provider: 'openai';
+}
+
+export async function callOpenAIImageGeneration(
+  apiKey: string,
+  opts: ImageGenerationOptions,
+): Promise<ImageGenerationResult> {
+  const format = opts.output_format || 'png';
+
+  const res = await fetch('https://api.openai.com/v1/images/generations', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': `Bearer ${apiKey}`,
+    },
+    body: JSON.stringify({
+      model: 'gpt-image-2',
+      prompt: opts.prompt,
+      size: opts.size || '1024x1024',
+      quality: opts.quality || 'high',
+      output_format: format,
+      response_format: 'b64_json',
+    }),
+    signal: AbortSignal.timeout(120_000),
+  });
+
+  if (!res.ok) {
+    const err: any = await res.json().catch(() => ({}));
+    throw new LlmError(res.status === 400 ? 422 : res.status, 'openai_error', err?.error?.message || res.statusText);
+  }
+
+  const data: any = await res.json();
+  const b64 = data.data?.[0]?.b64_json;
+  if (!b64) throw new LlmError(502, 'openai_error', 'No image data returned from OpenAI');
+
+  const buf = Buffer.from(b64, 'base64');
+  return {
+    base64: b64,
+    content_type: `image/${format}`,
+    size_bytes: buf.length,
+    revised_prompt: data.data?.[0]?.revised_prompt,
+    model: 'gpt-image-2',
+    provider: 'openai',
+  };
+}
+
 // ─── Google Gemini ───────────────────────────────────────────────────────────
 
 async function callGoogle(

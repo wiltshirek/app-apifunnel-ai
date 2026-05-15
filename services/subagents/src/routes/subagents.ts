@@ -8,7 +8,7 @@ import { getAdminFirestore, firestoreConfigured } from '../lib/firebase-admin';
 import { runSubagent } from '../lib/subagent-runner';
 import { getPreload } from '../lib/learning-graph/client';
 import { generateThreadId } from '../lib/utils/schedule';
-import { oneShotCompletion, LlmError } from '../lib/llm-call';
+import { oneShotCompletion, LlmError, callOpenAIImageGeneration, getProviderKey } from '../lib/llm-call';
 
 const MAX_CONCURRENT_PER_USER = 5;
 const DEFAULT_MAX_TURNS = 30;
@@ -137,6 +137,47 @@ subagentsRouter.post('/one-shot', async (c) => {
       return c.json({ error: err.code, message: err.message }, err.status as any);
     }
     console.error('[one-shot] unexpected error:', err);
+    return c.json({ error: 'internal_error', message: err?.message || 'Unknown error' }, 500);
+  }
+});
+
+/**
+ * POST /v1/subagents/create-image — Stateless image generation.
+ *
+ * Wraps OpenAI's gpt-image-2. OpenAI-only — no provider routing.
+ * The user's OpenAI key comes from their JWT api_settings, with
+ * WHISPER_OPENAI_API_KEY as a local/test fallback.
+ * Returns base64-encoded image bytes in the same shape as lakehouse /view.
+ */
+subagentsRouter.post('/create-image', async (c) => {
+  const auth = authenticateInternalRequest(c.req.raw);
+  if (!auth) return c.json({ error: 'Unauthorized' }, 401);
+
+  const body = await c.req.json();
+  if (!body.prompt || typeof body.prompt !== 'string') {
+    return c.json({ error: 'A prompt is required.' }, 400);
+  }
+
+  const apiSettings = (auth as any).api_settings ?? {};
+  const apiKey = getProviderKey(apiSettings, 'openai') || process.env.WHISPER_OPENAI_API_KEY;
+
+  if (!apiKey) {
+    return c.json({ error: 'No OpenAI API key available.' }, 401);
+  }
+
+  try {
+    const result = await callOpenAIImageGeneration(apiKey, {
+      prompt: body.prompt,
+      size: body.size,
+      quality: body.quality,
+      output_format: body.output_format,
+    });
+    return c.json(result);
+  } catch (err: any) {
+    if (err instanceof LlmError) {
+      return c.json({ error: err.code, message: err.message }, err.status as any);
+    }
+    console.error('[create-image] unexpected error:', err);
     return c.json({ error: 'internal_error', message: err?.message || 'Unknown error' }, 500);
   }
 });
