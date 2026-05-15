@@ -232,7 +232,6 @@ export async function callOpenAIImageGeneration(
       size: opts.size || '1024x1024',
       quality: opts.quality || 'high',
       output_format: format,
-      response_format: 'b64_json',
     }),
     signal: AbortSignal.timeout(120_000),
   });
