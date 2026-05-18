@@ -145,6 +145,17 @@ async def _extract_pdf_text(file_bytes: bytes, *, run_ocr: bool = False) -> Dict
         return {"page_count": 0, "pages": [], "full_text": ""}
 
 
+async def _background_embed(db, asset_id: str, text: str) -> None:
+    """Fire-and-forget: generate embedding and patch the asset doc."""
+    try:
+        from .embeddings import get_embedding
+        embedding = await get_embedding(text)
+        if embedding:
+            await db.assets.update_one({"_id": asset_id}, {"$set": {"embedding": embedding}})
+    except Exception as exc:
+        logger.warning("Background embedding failed for %s: %s", asset_id, exc)
+
+
 async def _extract_pdf_background(db, asset_id: str, file_bytes: bytes) -> None:
     """Fire-and-forget: extract text (+ OCR if needed) and patch the asset doc."""
     try:
@@ -767,7 +778,24 @@ async def persist_session_artifact(
     if client_meta:
         doc["client_meta"] = client_meta
 
+    # Text extraction for text-based content types (inline — fast, we already have bytes)
+    if _is_text_type(content_type):
+        try:
+            extracted_text = file_bytes.decode("utf-8")
+        except UnicodeDecodeError:
+            extracted_text = None
+        if extracted_text:
+            doc["extracted_text"] = extracted_text
+            from .embeddings import get_embedding
+            embedding = await get_embedding(extracted_text)
+            if embedding is not None:
+                doc["embedding"] = embedding
+
     await db.assets.replace_one({"_id": asset_id}, doc, upsert=True)
+
+    # PDF extraction in background (same pattern as upload_asset)
+    if content_type == "application/pdf":
+        asyncio.create_task(_extract_pdf_background(db, asset_id, file_bytes))
 
     return {
         "asset_id": asset_id,

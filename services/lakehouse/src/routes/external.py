@@ -571,8 +571,46 @@ async def api_text(asset_id: str, request: Request):
         return JSONResponse({"error": "Asset not found"}, status_code=404)
 
     text = (asset.get("extracted_text") or "").strip()
+
+    # On-demand fallback: extract from S3 if not already cached
     if not text:
-        return JSONResponse({"error": "No extracted text available for this asset. The file may be a scanned document that requires OCR re-processing — try re-uploading."}, status_code=400)
+        import asyncio
+        from datetime import datetime
+        from ..services.assets import _extract_pdf_text, _is_text_type, _background_embed
+
+        file_bytes = await download_file(asset.get("s3_key", ""))
+        if file_bytes:
+            content_type = asset.get("content_type", "")
+            if content_type == "application/pdf":
+                pdf = await _extract_pdf_text(file_bytes, run_ocr=True)
+                text = pdf["full_text"].strip()
+                if text:
+                    update = {
+                        "extracted_text": pdf["full_text"],
+                        "page_texts": {str(p["num"]): p["text"] for p in pdf["pages"]},
+                        "document": {
+                            "page_count": pdf["page_count"],
+                            "pages": [{"num": p["num"], "char_count": p["char_count"]} for p in pdf["pages"]],
+                        },
+                        "updated_at": datetime.utcnow(),
+                    }
+                    await db.assets.update_one({"_id": asset_id}, {"$set": update})
+                    asyncio.create_task(_background_embed(db, asset_id, text))
+            elif _is_text_type(content_type):
+                try:
+                    text = file_bytes.decode("utf-8").strip()
+                except UnicodeDecodeError:
+                    pass
+                if text:
+                    from ..services.embeddings import get_embedding
+                    embedding = await get_embedding(text)
+                    update = {"extracted_text": text, "updated_at": datetime.utcnow()}
+                    if embedding:
+                        update["embedding"] = embedding
+                    await db.assets.update_one({"_id": asset_id}, {"$set": update})
+
+    if not text:
+        return JSONResponse({"error": "No extractable text content"}, status_code=400)
 
     return JSONResponse({
         "asset_id": asset_id,
